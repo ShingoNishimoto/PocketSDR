@@ -33,7 +33,7 @@
 // constants and macros --------------------------------------------------------
 #define VER_FW       0x30       // Firmware version
 #ifndef F_TCXO
-#define F_TCXO       24000      // TCXO frequency (kHz)
+#define F_TCXO       10000      // TCXO frequency (kHz)
 #endif
 #define LOCK_A       36         // FX3 GPIO(36) <-- MAX2771 CH1 LD  (0x24)
 #define LOCK_B       37         // FX3 GPIO(37) <-- MAX2771 CH2 LD  (0x25)

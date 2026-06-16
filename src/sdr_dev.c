@@ -299,12 +299,12 @@ int sdr_dev_start(sdr_dev_t *dev)
         }
     }
 #endif
-    sdr_usb_req(dev->usb, 0, SDR_VR_START, 0, NULL, 0);
-    
+    sdr_usb_req(dev->usb, 1, SDR_VR_START, 0, NULL, 0);
+
     dev->state = 1;
     if (!sdr_thread_create(&dev->thread, event_handler, dev)) {
         dev->state = 0;
-        sdr_usb_req(dev->usb, 0, SDR_VR_STOP, 0, NULL, 0);
+        sdr_usb_req(dev->usb, 1, SDR_VR_STOP, 0, NULL, 0);
 #ifndef WIN32
         for (int i = 0; i < SDR_MAX_UBUFF; i++) {
             libusb_cancel_transfer(dev->usb->transfer[i]);
@@ -328,8 +328,8 @@ int sdr_dev_stop(sdr_dev_t *dev)
 {
     if (!dev->state) return 0;
     
-    sdr_usb_req(dev->usb, 0, SDR_VR_STOP, 0, NULL, 0);
-    
+    sdr_usb_req(dev->usb, 1, SDR_VR_STOP, 0, NULL, 0);
+
     dev->state = 0;
     sdr_thread_join(dev->thread);
 #ifndef WIN32
