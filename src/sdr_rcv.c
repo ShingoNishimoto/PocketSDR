@@ -1663,7 +1663,7 @@ sdr_rcv_t *sdr_rcv_open_dev(const char **sigs, int *prns, int n, int bus,
     sdr_dev_t *dev;
     double fs, fo[SDR_MAX_RFCH] = {0};
     int fmt, nch, IQ[SDR_MAX_RFCH] = {0}, bits[SDR_MAX_RFCH] = {0};
-    
+
     if (!(dev = sdr_dev_open(bus, port))) {
         return NULL;
     }
@@ -1678,6 +1678,12 @@ sdr_rcv_t *sdr_rcv_open_dev(const char **sigs, int *prns, int n, int bus,
         sdr_dev_close(dev);
         return NULL;
     }
+    // -FS=<MHz> in opt overrides the sampling rate reported by the device
+    // (needed when the device ADC clock differs from the actual GPIF output rate)
+    const char *p;
+    double fs_opt = 0.0;
+    if ((p = strstr(opt, "-FS="))) sscanf(p, "-FS=%lf", &fs_opt);
+    if (fs_opt > 0.0) fs = fs_opt * 1e6;
     sdr_rcv_t *rcv = sdr_rcv_new(sigs, prns, n, fmt, fs, fo, IQ, bits, opt);
     if (!sdr_rcv_start(rcv, SDR_DEV_USB, (void *)dev, paths)) {
         sdr_dev_close(dev);
@@ -1872,7 +1878,7 @@ void sdr_rcv_setopt(const char *opt, double value)
     extern double sdr_epoch, sdr_lag_epoch, sdr_el_mask, sdr_sp_corr, sdr_t_acq;
     extern double sdr_t_dll, sdr_b_dll, sdr_b_pll, sdr_b_fll_w, sdr_b_fll_n;
     extern double sdr_max_dop, sdr_thres_cn0_l, sdr_thres_cn0_u;
-    extern int sdr_bump_jump;
+    extern int sdr_bump_jump, sdr_ionoopt;
     if      (!strcmp(opt, "epoch"      )) sdr_epoch       = value;
     else if (!strcmp(opt, "lag_epoch"  )) sdr_lag_epoch   = value;
     else if (!strcmp(opt, "el_mask"    )) sdr_el_mask     = value;
@@ -1886,7 +1892,8 @@ void sdr_rcv_setopt(const char *opt, double value)
     else if (!strcmp(opt, "max_dop"    )) sdr_max_dop     = value;
     else if (!strcmp(opt, "thres_cn0_l")) sdr_thres_cn0_l = value;
     else if (!strcmp(opt, "thres_cn0_u")) sdr_thres_cn0_u = value;
-    else if (!strcmp(opt, "bump_jump"  )) sdr_bump_jump = (int)value;
+    else if (!strcmp(opt, "bump_jump"  )) sdr_bump_jump   = (int)value;
     else if (!strcmp(opt, "max_acq"    )) sdr_max_acq     = value;
+    else if (!strcmp(opt, "ionoopt"    )) sdr_ionoopt     = (int)value;
     else fprintf(stderr, "sdr_rcv_setopt error opt=%s\n", opt);
 }

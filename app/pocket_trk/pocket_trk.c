@@ -166,7 +166,7 @@ int main(int argc, char **argv)
     int bits[SDR_MAX_RFCH] = {2, 2, 2, 2, 2, 2, 2, 2};
     int dev_type = SDR_DEV_FILE, bus = -1, port = -1, nrow = 0;
     int max_row = MAX_ROW;
-    double fs = 12e6, fo[SDR_MAX_RFCH] = {0}, toff = 0.0, tscale = 1.0;
+    double fs = 12e6, fs_user = 0.0, fo[SDR_MAX_RFCH] = {0}, toff = 0.0, tscale = 1.0;
     double tint = 0.1;
     const char *sig = "L1CA", *sigs[SDR_MAX_NCH];
     const char *file = "", *conf_file = "";
@@ -209,7 +209,7 @@ int main(int argc, char **argv)
                 exit(-1);
             }
         } else if (!strcmp(argv[i], "-f") && i + 1 < argc) {
-            fs = atof(argv[++i]) * 1e6;
+            fs = fs_user = atof(argv[++i]) * 1e6;
         } else if (!strcmp(argv[i], "-fo") && i + 1 < argc) {
             sscanf(argv[++i], "%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf", fo, fo + 1,
                 fo + 2, fo + 3, fo + 4, fo + 5, fo + 6, fo + 7);
@@ -282,6 +282,12 @@ int main(int argc, char **argv)
     if (bw > 0.0) {
         size_t len = strlen(rfch_opt);
         snprintf(rfch_opt + len, sizeof(rfch_opt) - len, " -BW=%.3f", bw);
+    }
+    if (fs_user > 0.0 && !*file && !*driver) {
+        // propagate -f to device mode via opt string so sdr_rcv_open_dev
+        // can override the sampling rate computed from device registers
+        size_t len = strlen(rfch_opt);
+        snprintf(rfch_opt + len, sizeof(rfch_opt) - len, " -FS=%.6f", fs_user * 1e-6);
     }
     if (*file) {
         rcv = sdr_rcv_open_file(sigs, prns, nch, fmt, fs, fo, IQ, bits, toff,
