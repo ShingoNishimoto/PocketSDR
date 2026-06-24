@@ -283,6 +283,7 @@ def sys_opt_new(opt_p=None):
     opt.thres_cn0_u = StringVar()
     opt.bump_jump = StringVar()
     opt.max_acq = StringVar()
+    opt.ionoopt = StringVar()
     opt.fftw_wisdom_path = StringVar()
     opt.rcv_options = StringVar()
     if opt_p != None:
@@ -302,6 +303,7 @@ def sys_opt_new(opt_p=None):
         opt.thres_cn0_u.set(opt_p.thres_cn0_u.get())
         opt.bump_jump.set(opt_p.bump_jump.get())
         opt.max_acq.set(opt_p.max_acq.get())
+        opt.ionoopt.set(opt_p.ionoopt.get())
         opt.fftw_wisdom_path.set(opt_p.fftw_wisdom_path.get())
         opt.rcv_options.set(opt_p.rcv_options.get())
     else:
@@ -321,6 +323,7 @@ def sys_opt_new(opt_p=None):
         opt.thres_cn0_u.set('30.0')
         opt.bump_jump.set('OFF')
         opt.max_acq.set('4.0')
+        opt.ionoopt.set('Broadcast')
     return opt
 
 # generate array option variables ----------------------------------------------
@@ -624,7 +627,8 @@ def sys_opt_dlg(root, opt):
         'C/N0 Threshold for Signal Locked (dB-Hz)',
         'C/N0 Threshold for Signal Lost (dB-Hz)', 'Bump Jump for BOC Modulation',
         'Signal Acquisition Mode',
-        'Max Code Length for direct acquisition (ms)')
+        'Max Code Length for direct acquisition (ms)',
+        'Ionosphere Model')
     opt_new = sys_opt_new(opt)
     dlg = modal_dlg_new(root, 420, 580, 'System Options')
     panel1 = Frame(dlg.panel, bg=BG_COLOR, relief=GROOVE, borderwidth=2)
@@ -635,6 +639,8 @@ def sys_opt_dlg(root, opt):
         '1.0'), var=opt_new.lag_epoch, width=10)
     sel_panel_new(panel1, labels[2], sels=('5', '10', '15', '20', '25',
         '30'), var=opt_new.el_mask, width=10)
+    sel_panel_new(panel1, labels[16], sels=('OFF', 'Broadcast', 'SBAS',
+        'IF LC (L1+L2)'), var=opt_new.ionoopt, width=14)
     panel2 = Frame(dlg.panel, bg=BG_COLOR, relief=GROOVE, borderwidth=2)
     panel2.pack(fill=X, pady=2, ipady=1)
     sel_panel_new(panel2, labels[3], sels=('0.05', '0.1', '0.15', '0.2', '0.25',

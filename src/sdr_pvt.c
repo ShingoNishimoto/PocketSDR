@@ -33,6 +33,7 @@
 double sdr_epoch     = SDR_EPOCH;
 double sdr_lag_epoch = LAG_EPOCH;
 double sdr_el_mask   = EL_MASK;
+int    sdr_ionoopt   = IONOOPT_BRDC;
 static const int systems[] = {
     SYS_GPS, SYS_GLO, SYS_GAL, SYS_QZS, SYS_CMP, SYS_IRN, SYS_SBS, 0
 };
@@ -1062,7 +1063,7 @@ static void update_sol(sdr_pvt_t *pvt)
     prcopt_t opt = prcopt_default;
     opt.navsys |= SYS_GLO | SYS_GAL | SYS_QZS | SYS_CMP | SYS_IRN;
     opt.err[1] = opt.err[2] = STD_ERR;
-    opt.ionoopt = IONOOPT_BRDC;
+    opt.ionoopt = sdr_ionoopt;
     opt.tropopt = TROPOPT_SAAS;
     opt.elmin = sdr_el_mask * D2R;
 #if 1 // RAIM-FDE on

@@ -333,6 +333,8 @@ def set_rcv_opts(sys_opt):
     libsdr.sdr_rcv_setopt('thres_cn0_u'.encode(), float(sys_opt.thres_cn0_u.get()))
     libsdr.sdr_rcv_setopt('bump_jump'.encode(), float(sys_opt.bump_jump.get() == 'ON'))
     libsdr.sdr_rcv_setopt('max_acq'.encode(), float(sys_opt.max_acq.get()))
+    ionoopt_vals = {'OFF': 0, 'Broadcast': 1, 'SBAS': 2, 'IF LC (L1+L2)': 3}
+    libsdr.sdr_rcv_setopt('ionoopt'.encode(), float(ionoopt_vals.get(sys_opt.ionoopt.get(), 1)))
 
 # set log mask -----------------------------------------------------------------
 def set_log_mask(out_opt):

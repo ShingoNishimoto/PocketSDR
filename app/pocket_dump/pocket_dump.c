@@ -284,7 +284,7 @@ int main(int argc, char **argv)
     char *files[SDR_MAX_RFCH] = {0}, path[SDR_MAX_RFCH][64];
     const char *conf_file = "", *driver = "";
     gtime_t dump_time;
-    double tsec = 0.0, fs = 12e6, fo[SDR_MAX_RFCH] = {0};
+    double tsec = 0.0, fs = 12e6, fs_user = 0.0, fo[SDR_MAX_RFCH] = {0};
     double gain = 0.0, bw = 0.0;
     int n = 0, bus = -1, port = -1, raw = 0, quiet = 0;
     int nch, fmt = SDR_FMT_CS8, IQ[SDR_MAX_RFCH], bits[SDR_MAX_RFCH], nfile;
@@ -309,7 +309,7 @@ int main(int argc, char **argv)
                 return -1;
             }
         } else if (!strcmp(argv[i], "-f") && i + 1 < argc) {
-            fs = atof(argv[++i]) * 1e6;
+            fs = fs_user = atof(argv[++i]) * 1e6;
         } else if (!strcmp(argv[i], "-fo") && i + 1 < argc) {
             sscanf(argv[++i], "%lf", fo);
             fo[0] *= 1e6;
@@ -348,10 +348,12 @@ int main(int argc, char **argv)
             return -1;
         }
         if (*conf_file) sdr_sleep_msec(50);
-        if (!(nch = sdr_dev_get_info(dev, &fmt, &fs, fo, IQ, bits))) {
+        double fs_dev = fs;
+        if (!(nch = sdr_dev_get_info(dev, &fmt, &fs_dev, fo, IQ, bits))) {
             sdr_dev_close(dev);
             return -1;
         }
+        fs = (fs_user > 0.0) ? fs_user : fs_dev;  // -f flag overrides device fs
         nfile = raw ? 1 : nch;
     }
     dump_time = utc2gpst(timeget());

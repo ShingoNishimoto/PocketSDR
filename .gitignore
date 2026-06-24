@@ -11,3 +11,30 @@ __pycache__
 work
 bladerf
 pocketsdr-env
+
+# Built Linux binaries (bin/ also contains tracked .exe for Windows)
+app/convbin/convbin
+app/pocket_acq/pocket_acq
+app/pocket_calib/pocket_calib
+app/pocket_conf/pocket_conf
+app/pocket_dump/pocket_dump
+app/pocket_scan/pocket_scan
+app/pocket_snap/pocket_snap
+app/pocket_trk/pocket_trk
+app/str2str/str2str
+app/pocket_trk/fftw_wisdom
+bin/convbin
+bin/fftw_wisdom
+bin/pocket_acq
+bin/pocket_calib
+bin/pocket_conf
+bin/pocket_dump
+bin/pocket_scan
+bin/pocket_snap
+bin/pocket_trk
+bin/str2str
+
+# Generated files
+fftw_wisdom.txt
+python/pocket_sdr.ini
+.pocket_navdata.csv

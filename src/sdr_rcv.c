@@ -30,7 +30,7 @@
 #define FAST_DOP   500.0        // fast acquisition Doppler half-width (Hz)
 #define MIN_LOCK   2.0          // min lock time for re-acquisition (s)
 #define NUM_COL    106          // number of channel status columns
-#define MAX_ACQ    4.0          // max code length for direct acquisition (ms)
+#define MAX_ACQ    25.0         // max code length for direct acquisition (ms)
 #define MAX_BUFF_USE 90         // max buffer usage rate (%)
 #define MAX_BAR    12           // C/N0 bar width
 #define SAMPLES_STATS 100       // samples for stats

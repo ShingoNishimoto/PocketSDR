@@ -508,7 +508,8 @@ static void set_fixed(int type, uint32_t regs[][SDR_MAX_REG])
                 if (!reg_field[i].fix[0]) continue;
                 val = reg_field[i].val[0];
             } else if (!strcmp(reg_field[i].field, "EXTADCCLK")) {
-                val = (type == TYPE_POCKET_2CH && j == 0) ? 0 : 1; // 0:int,1:ext
+                // val = (type == TYPE_POCKET_2CH && j == 0) ? 0 : 1; // 0:int,1:ext
+                val = (j == 0) ? 0 : 1; // CH1: internal (XTAL->divider->ADC), CH2+: external (from CH1 CLKOUT)
             } else {
                 if (!reg_field[i].fix[j >= 1 ? 1 : 0]) continue;
                 val = reg_field[i].val[j >= 1 ? 1 : 0];
