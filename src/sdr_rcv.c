@@ -1878,7 +1878,7 @@ void sdr_rcv_setopt(const char *opt, double value)
     extern double sdr_epoch, sdr_lag_epoch, sdr_el_mask, sdr_sp_corr, sdr_t_acq;
     extern double sdr_t_dll, sdr_b_dll, sdr_b_pll, sdr_b_fll_w, sdr_b_fll_n;
     extern double sdr_max_dop, sdr_thres_cn0_l, sdr_thres_cn0_u;
-    extern int sdr_bump_jump, sdr_ionoopt;
+    extern int sdr_bump_jump, sdr_ionoopt, sdr_pmode;
     if      (!strcmp(opt, "epoch"      )) sdr_epoch       = value;
     else if (!strcmp(opt, "lag_epoch"  )) sdr_lag_epoch   = value;
     else if (!strcmp(opt, "el_mask"    )) sdr_el_mask     = value;
@@ -1895,5 +1895,6 @@ void sdr_rcv_setopt(const char *opt, double value)
     else if (!strcmp(opt, "bump_jump"  )) sdr_bump_jump   = (int)value;
     else if (!strcmp(opt, "max_acq"    )) sdr_max_acq     = value;
     else if (!strcmp(opt, "ionoopt"    )) sdr_ionoopt     = (int)value;
+    else if (!strcmp(opt, "pmode"      )) sdr_pmode       = (int)value;
     else fprintf(stderr, "sdr_rcv_setopt error opt=%s\n", opt);
 }

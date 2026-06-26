@@ -50,6 +50,7 @@ static const char *usage_text[] = {
     "       [-fo freq[,...]] [-IQ {1|2}[,...]] [-bits {2|3}[,...]",
     "       [-toff toff] [-ti tint] [-p bus,[,port] [-c conf_file]",
     "       [-driver name] [-gain gain] [-bw bw] [-fd dopp]",
+    "       [-ppp] [-ppps] [-pppg] [-pppsg]",
     "       [-log path] [-nmea path] [-rtcm path] [-raw path] [-opt file] [file]",
     NULL
 };
@@ -169,27 +170,48 @@ int main(int argc, char **argv)
     double fs = 12e6, fs_user = 0.0, fo[SDR_MAX_RFCH] = {0}, toff = 0.0, tscale = 1.0;
     double tint = 0.1;
     const char *sig = "L1CA", *sigs[SDR_MAX_NCH];
+    const char *sig_list[8]; int nsig_cur = 1; // current -sig list
     const char *file = "", *conf_file = "";
     const char *paths[4] = {"", "", "", ""}, *opt_file = "";
     const char *debug_file = "";
     const char *driver = "";
     double gain = 0.0, bw = 0.0, max_dop = 0.0;
     char rfch_opt[1024] = "-RFCH";
-    
+    sig_list[0] = sig;
+
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-sig") && i + 1 < argc) {
-            sig = argv[++i];
+            // split comma-separated signal list (e.g. "L1CA,L2CM")
+            // modifies argv[i] in-place: safe since argv persists for main's lifetime
+            char *p = argv[++i];
+            nsig_cur = 0;
+            sig_list[nsig_cur++] = p;
+            for (; *p; p++) {
+                if (*p == ',' && nsig_cur < 8) {
+                    *p = '\0';
+                    sig_list[nsig_cur++] = p + 1;
+                }
+            }
+            sig = sig_list[0];
         } else if (!strcmp(argv[i], "-prn") && i + 1 < argc) {
             int nums[SDR_MAX_NCH];
             int n = sdr_parse_nums(argv[++i], nums);
-            for (int j = 0; j < n && nch < SDR_MAX_NCH; j++) {
-                sigs[nch] = sig;
-                prns[nch++] = nums[j];
+            for (int s = 0; s < nsig_cur; s++) {
+                for (int j = 0; j < n && nch < SDR_MAX_NCH; j++) {
+                    sigs[nch] = sig_list[s];
+                    prns[nch++] = nums[j];
+                }
             }
         } else if (!strcmp(argv[i], "-rfch") && i + 1 < argc) {
-            size_t len = strlen(rfch_opt);
-            snprintf(rfch_opt + len, sizeof(rfch_opt) - len, " %s:%s", sig,
-                argv[++i]);
+            // split comma-separated rfch values paired with sig_list
+            char rbuf[256];
+            snprintf(rbuf, sizeof(rbuf), "%s", argv[++i]);
+            char *p = strtok(rbuf, ",");
+            for (int s = 0; p && s < nsig_cur; s++, p = strtok(NULL, ",")) {
+                size_t len = strlen(rfch_opt);
+                snprintf(rfch_opt + len, sizeof(rfch_opt) - len, " %s:%s",
+                    sig_list[s], p);
+            }
         } else if (!strcmp(argv[i], "-toff") && i + 1 < argc) {
             toff = atof(argv[++i]);
         } else if (!strcmp(argv[i], "-tscale") && i + 1 < argc) {
@@ -236,6 +258,16 @@ int main(int argc, char **argv)
             paths[3] = argv[++i];
         } else if (!strcmp(argv[i], "-h") && i + 1 < argc) {
             max_row = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "-ppp")) {
+            sdr_rcv_setopt("pmode", PMODE_PPP_KINEMA);
+        } else if (!strcmp(argv[i], "-ppps")) {
+            sdr_rcv_setopt("pmode", PMODE_PPP_STATIC);
+        } else if (!strcmp(argv[i], "-pppg")) {
+            sdr_rcv_setopt("pmode", PMODE_PPP_KINEMA);
+            sdr_rcv_setopt("ionoopt", IONOOPT_GRAPHIC);
+        } else if (!strcmp(argv[i], "-pppsg")) {
+            sdr_rcv_setopt("pmode", PMODE_PPP_STATIC);
+            sdr_rcv_setopt("ionoopt", IONOOPT_GRAPHIC);
         } else if (!strcmp(argv[i], "-opt") && i + 1 < argc) {
             opt_file = argv[++i];
         } else if (!strcmp(argv[i], "-debug") && i + 1 < argc) {

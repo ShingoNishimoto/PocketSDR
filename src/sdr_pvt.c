@@ -34,6 +34,7 @@ double sdr_epoch     = SDR_EPOCH;
 double sdr_lag_epoch = LAG_EPOCH;
 double sdr_el_mask   = EL_MASK;
 int    sdr_ionoopt   = IONOOPT_BRDC;
+int    sdr_pmode     = PMODE_SINGLE;
 static const int systems[] = {
     SYS_GPS, SYS_GLO, SYS_GAL, SYS_QZS, SYS_CMP, SYS_IRN, SYS_SBS, 0
 };
@@ -208,8 +209,8 @@ static void out_log_pos(double time, const sol_t *sol, int nsat)
     covenu(pos, P, Q);
     sdr_log(3, "$POS,%.3f,%.0f,%.0f,%.0f,%.0f,%.0f,%.3f,%.9f,%.9f,%.3f,%d,%d,"
         "%.3f,%.3f,%.3f,%.9f", time, ep[0], ep[1], ep[2], ep[3], ep[4], ep[5],
-        pos[0] * R2D, pos[1] * R2D, pos[2], 5, sol->ns, SQRT(Q[4]), SQRT(Q[0]),
-        SQRT(Q[8]), sol->dtr[0]);
+        pos[0] * R2D, pos[1] * R2D, pos[2], sol->stat, sol->ns, SQRT(Q[4]),
+        SQRT(Q[0]), SQRT(Q[8]), sol->dtr[0]);
 }
 
 //------------------------------------------------------------------------------
@@ -696,6 +697,17 @@ sdr_pvt_t *sdr_pvt_new(sdr_rcv_t *rcv)
     pvt->ssat = (ssat_t *)sdr_malloc(sizeof(ssat_t) * MAXSAT);
     pvt->rtcm = (rtcm_t *)sdr_malloc(sizeof(rtcm_t));
     init_rtcm(pvt->rtcm);
+    if (sdr_pmode >= PMODE_PPP_KINEMA) {
+        prcopt_t opt = prcopt_default;
+        opt.mode    = sdr_pmode;
+        opt.navsys  = SYS_GPS | SYS_GLO | SYS_GAL | SYS_QZS | SYS_CMP | SYS_IRN;
+        opt.ionoopt = (sdr_ionoopt==IONOOPT_GRAPHIC) ? IONOOPT_GRAPHIC : IONOOPT_IFLC;
+        opt.tropopt = TROPOPT_ESTG;
+        if (sdr_ionoopt==IONOOPT_GRAPHIC) opt.modear = ARMODE_OFF; /* float bias only */
+        opt.elmin   = sdr_el_mask * D2R;
+        pvt->rtk = (rtk_t *)sdr_malloc(sizeof(rtk_t));
+        rtkinit(pvt->rtk, &opt);
+    }
     set_obs_idx(rcv);
     pvt->rcv = rcv;
     sdr_mutex_init(&pvt->mtx);
@@ -726,6 +738,10 @@ void sdr_pvt_free(sdr_pvt_t *pvt)
     sdr_free(pvt->ssat);
     free_rtcm(pvt->rtcm);
     sdr_free(pvt->rtcm);
+    if (pvt->rtk) {
+        rtkfree(pvt->rtk);
+        sdr_free(pvt->rtk);
+    }
     sdr_free(pvt);
 }
 
@@ -747,6 +763,11 @@ static double gen_prng(gtime_t time, const sdr_ch_t *ch)
     
     if (ch->week > 0) {
         tau = (week - ch->week) * 86400.0 * 7 + tow - ch->tow * 1e-3 + ch->coff;
+    } else if (ch->tow_v == 1) { // tow valid but GPS week not yet decoded from nav
+        // use current GPS week from receiver time; handle end-of-week wrap
+        tau = tow - ch->tow * 1e-3 + ch->coff;
+        if (tau < -302400.0) tau += 604800.0;
+        if (tau >  302400.0) tau -= 604800.0;
     } else if (ch->tow_v == 2) { // resolve 100 ms ambiguity (0.05 <= tau < 0.15)
         tau = tow - ch->tow * 1e-3 + ch->coff + ch->nav->coff;
         tau -= floor(tau / 0.1) * 0.1;
@@ -1057,63 +1078,155 @@ static void update_azel(const nav_t *nav, const sol_t *sol, ssat_t *ssat)
     }
 }
 
+// save last fix and output solution logs --------------------------------------
+static void output_sol(sdr_pvt_t *pvt, double time)
+{
+    corr_sol_time(pvt->sol);
+    pvt->last_time  = pvt->sol->time;
+    pvt->last_rr[0] = pvt->sol->rr[0];
+    pvt->last_rr[1] = pvt->sol->rr[1];
+    pvt->last_rr[2] = pvt->sol->rr[2];
+    pvt->last_dtr   = pvt->sol->dtr[0];
+    pvt->last_dtrd  = pvt->sol->dtr[5];
+    pvt->last_valid = 1;
+    out_log_pos(time, pvt->sol, pvt->obs->n);
+    out_nmea(pvt->sol, pvt->ssat, pvt->rcv->strs[0]);
+    pvt->count[0]++;
+    for (int i = 0; i < MAXSAT; i++) {
+        if (pvt->ssat[i].snr[0] == 0) continue;
+        out_log_sat(time, i + 1, pvt->sol, pvt->ssat + i);
+    }
+}
+
 // update PVT solution ---------------------------------------------------------
 static void update_sol(sdr_pvt_t *pvt)
 {
-    prcopt_t opt = prcopt_default;
-    opt.navsys |= SYS_GLO | SYS_GAL | SYS_QZS | SYS_CMP | SYS_IRN;
-    opt.err[1] = opt.err[2] = STD_ERR;
-    opt.ionoopt = sdr_ionoopt;
-    opt.tropopt = TROPOPT_SAAS;
-    opt.elmin = sdr_el_mask * D2R;
-#if 1 // RAIM-FDE on
-    opt.posopt[4] = 1;
-#endif
     double time = pvt->ix * SDR_CYC;
     obsd_t obs[MAXSAT];
     int mask[MAXSAT] = {0}, nobs = 0;
     char msg[128] = "";
-    
-    // delete duplicated L1 obs data
+
+    // deduplicate: one entry per satellite (L1+L2 merged in same obsd_t)
     for (int i = 0; i < pvt->obs->n && nobs < MAXSAT; i++) {
         int sat = pvt->obs->data[i].sat;
         if (pvt->obs->data[i].P[0] == 0.0 || mask[sat-1]) continue;
         obs[nobs++] = pvt->obs->data[i];
         mask[sat-1] = 1;
     }
-    // point positioning with L1 pseudorange
-    if (pntpos(obs, nobs, pvt->nav, &opt, pvt->sol, NULL, pvt->ssat, msg)) {
-        
-        // correct solution time
-        corr_sol_time(pvt->sol);
-        
-        // save last fix for fast acquisition
-        pvt->last_time  = pvt->sol->time;
-        pvt->last_rr[0] = pvt->sol->rr[0];
-        pvt->last_rr[1] = pvt->sol->rr[1];
-        pvt->last_rr[2] = pvt->sol->rr[2];
-        pvt->last_dtr   = pvt->sol->dtr[0];
-        pvt->last_dtrd  = pvt->sol->dtr[5];   // clock drift rate (s/s)
-        pvt->last_valid = 1;
+    // merge L2+ from split entries (race: L2CM thread runs before L1CA thread)
+    for (int i = 0; i < pvt->obs->n; i++) {
+        const obsd_t *d = pvt->obs->data + i;
+        if (d->P[0] != 0.0) continue; // L1 present → already merged above
+        for (int j = 0; j < nobs; j++) {
+            if (obs[j].sat != d->sat) continue;
+            for (int k = 1; k < NFREQ + NEXOBS; k++) {
+                if (d->code[k] && !obs[j].code[k]) {
+                    obs[j].code[k] = d->code[k];
+                    obs[j].P[k]    = d->P[k];
+                    obs[j].L[k]    = d->L[k];
+                    obs[j].D[k]    = d->D[k];
+                    obs[j].SNR[k]  = d->SNR[k];
+                    obs[j].LLI[k]  = d->LLI[k];
+                }
+            }
+            break;
+        }
+    }
+    if (sdr_pmode >= PMODE_PPP_KINEMA) {
+        // Set time interval for KF process noise propagation (rtkpos() normally does this)
+        gtime_t obs_time = nobs > 0 ? obs[0].time : pvt->time;
+        pvt->rtk->tt = pvt->rtk->sol.time.time > 0 ?
+            timediff(obs_time, pvt->rtk->sol.time) : 0.0;
 
-        // output log $POS and NMEA RMC, GGA, GSA and GSV
-        out_log_pos(time, pvt->sol, pvt->obs->n);
-        out_nmea(pvt->sol, pvt->ssat, pvt->rcv->strs[0]);
-        pvt->count[0]++;
-        
-        // output log $SAT
-        for (int i = 0; i < MAXSAT; i++) {
-            if (pvt->ssat[i].snr[0] == 0) continue;
-            out_log_sat(time, i + 1, pvt->sol, pvt->ssat + i);
+        // Seed pppos EKF with SPP position (pppos needs rtk->sol.rr != {0,0,0})
+        // This also sets rtk->sol.time = obs_time for next epoch's tt computation.
+        prcopt_t spopt = prcopt_default;
+        spopt.navsys |= SYS_GLO | SYS_GAL | SYS_QZS | SYS_CMP | SYS_IRN;
+        spopt.elmin = sdr_el_mask * D2R;
+        // Pass pvt->rtk->ssat so pntpos sets ssat[sat].vs=1; pppos needs vs=1 to accept obs
+        pntpos(obs, nobs, pvt->nav, &spopt, &pvt->rtk->sol, NULL, pvt->rtk->ssat, msg);
+
+        // Initialize clock states from pntpos when x[IC]=0.
+        // udclk_ppp() initializes clocks only when norm(x[0:3])=0, but udpos_ppp()
+        // runs first and sets x[0..2] non-zero from sol.rr (seeded by pntpos above).
+        // Without this, x[IC]=0 forever, residuals include the ~15m GPS clock bias,
+        // every measurement is rejected by post-fit, and the KF is permanently frozen.
+        // This replicates what udclk_ppp would have done had udpos_ppp not run first.
+        {
+            int np = pvt->rtk->opt.dynamics ? 9 : 3;
+            for (int i = 0; i < NSYS; i++) {
+                int ic = np + i;
+                if (pvt->rtk->x[ic] == 0.0 && pvt->rtk->sol.dtr[i] != 0.0) {
+                    double dtr = i == 0 ? pvt->rtk->sol.dtr[0] :
+                                          pvt->rtk->sol.dtr[0] + pvt->rtk->sol.dtr[i];
+                    pvt->rtk->x[ic] = CLIGHT * dtr;
+                    pvt->rtk->P[ic + ic * pvt->rtk->nx] = 60.0 * 60.0; /* VAR_CLK */
+                }
+            }
+        }
+
+        // PPP: dual-frequency Kalman filter via pppos()
+        pppos(pvt->rtk, obs, nobs, pvt->nav);
+
+        // Diagnostics: log KF position state and dual-freq measurement count
+        {
+            double *x = pvt->rtk->x;
+            double *P = pvt->rtk->P;
+            int nx = pvt->rtk->nx;
+            int ndualfreq = 0;
+            for (int i = 0; i < nobs; i++) {
+                if (obs[i].code[1] && obs[i].P[1] != 0.0 && obs[i].L[1] != 0.0) ndualfreq++;
+            }
+            double pos_std = nx > 0 ? sqrt(P[0]+P[1+nx]+P[2+2*nx]) : -1;
+            int np = pvt->rtk->opt.dynamics ? 9 : 3;
+            double x_clk = nx > np ? x[np] : 0.0;
+            sdr_log(3, "$LOG,%.3f,PPPOS_DBG kf_pos=%.1f,%.1f,%.1f pos_std=%.3f ndual=%d stat=%d clk=%.3f",
+                time, x[0], x[1], x[2], pos_std, ndualfreq, pvt->rtk->sol.stat, x_clk);
+        }
+
+        // udbias_ppp() increments outc every epoch; update_stat() resets it but
+        // only when stat==SOLQ_PPP. During convergence (stat=SOLQ_SINGLE), outc
+        // keeps climbing and phase biases are wiped every maxout epochs even for
+        // continuously tracked sats. Reset outc here for any sat with valid L2
+        // obs so genuine outages (sat not in obs this epoch) still trigger resets.
+        for (int i = 0; i < nobs; i++) {
+            int valid_l1 = obs[i].code[0] && obs[i].P[0] != 0.0 && obs[i].L[0] != 0.0;
+            int valid_l2 = obs[i].code[1] && obs[i].P[1] != 0.0 && obs[i].L[1] != 0.0;
+            if ((sdr_ionoopt == IONOOPT_GRAPHIC) ? valid_l1 : valid_l2) {
+                pvt->rtk->ssat[obs[i].sat - 1].outc[0] = 0;
+            }
+        }
+
+        *pvt->sol = pvt->rtk->sol;
+        memcpy(pvt->ssat, pvt->rtk->ssat, sizeof(ssat_t) * MAXSAT);
+
+        if (pvt->sol->stat) {
+            output_sol(pvt, time);
+        } else {
+            update_azel(pvt->nav, pvt->sol, pvt->ssat);
+            pvt->sol->ns = 0;
+            sdr_log(3, "$LOG,%.3f,PPPOS NO SOLUTION", time);
         }
     } else {
-        // update satellite az/el angles
-        update_azel(pvt->nav, pvt->sol, pvt->ssat);
-        pvt->sol->ns = 0;
-        sdr_log(3, "$LOG,%.3f,PNTPOS ERROR,%s", time, msg);
+        // SPP: single-point positioning with pseudorange
+        prcopt_t opt = prcopt_default;
+        opt.navsys |= SYS_GLO | SYS_GAL | SYS_QZS | SYS_CMP | SYS_IRN;
+        opt.err[1] = opt.err[2] = STD_ERR;
+        opt.ionoopt = sdr_ionoopt;
+        opt.tropopt = TROPOPT_SAAS;
+        opt.elmin = sdr_el_mask * D2R;
+        opt.posopt[4] = 1; // RAIM-FDE
+
+        if (pntpos(obs, nobs, pvt->nav, &opt, pvt->sol, NULL, pvt->ssat, msg)) {
+            output_sol(pvt, time);
+        } else {
+            update_azel(pvt->nav, pvt->sol, pvt->ssat);
+            pvt->sol->ns = 0;
+            sdr_log(3, "$LOG,%.3f,PNTPOS ERROR,%s", time, msg);
+        }
     }
     pvt->nsat = pvt->obs->n;
-    
+
     // for debug
     double pos[3];
     ecef2pos(pvt->sol->rr, pos);
@@ -1180,6 +1293,7 @@ void sdr_pvt_udsol(sdr_pvt_t *pvt, int64_t ix)
         ix >= pvt->ix + (int)(sdr_lag_epoch / SDR_CYC))) {
         
         // resolve msec ambiguity in pseudorange
+        res_obs_amb(pvt->obs, SYS_GPS | SYS_QZS, CODE_L2S, 1e-3);  // L2CM (1ms GPS code period)
         res_obs_amb(pvt->obs, SYS_GPS | SYS_QZS, CODE_L5Q, 20e-3); // L5Q
         res_obs_amb(pvt->obs, SYS_QZS, CODE_L5P, 20e-3); // L5SQ, L5SQV
         res_obs_amb(pvt->obs, SYS_GLO, CODE_L3Q, 10e-3); // G3OCP
@@ -1208,8 +1322,11 @@ void sdr_pvt_udsol(sdr_pvt_t *pvt, int64_t ix)
         pvt->nch = pvt->obs->n = 0; 
         
         // adjust epoch cycle within 20 ms
+        // pntpos (SPP) stores sol.dtr in seconds; pppos (PPP) stores in meters
         if (pvt->sol->stat) {
-            double dtr = ROUND(pvt->sol->dtr[0] / 0.02) * 0.02;
+            double dtr_s = pvt->sol->dtr[0];
+            if (sdr_pmode >= PMODE_PPP_KINEMA) dtr_s /= CLIGHT;
+            double dtr = ROUND(dtr_s / 0.02) * 0.02;
             if (fabs(dtr) > 0.01) {
                 pvt->ix += (int)(dtr / SDR_CYC);
                 sdr_log(3, "$LOG,%.3f,PVT EPOCH ADJUSTED (DT=%.3fs)",
@@ -1233,12 +1350,13 @@ void sdr_pvt_udsol(sdr_pvt_t *pvt, int64_t ix)
 //
 void sdr_pvt_solstr(sdr_pvt_t *pvt, char *buff, int size)
 {
+    static const char *solq[] = {"---","FIX","FLT","SBS","DGP","SPP","PPP","DR"};
     char tstr[32] = "", nstr[16] = "";
     double pos[3] = {0};
     int stat = 0;
-    
+
     sdr_mutex_lock(&pvt->mtx);
-    
+
     if (norm(pvt->sol->rr, 3) > 1e-6) {
         time2str(pvt->sol->time, tstr, 1);
         ecef2pos(pvt->sol->rr, pos);
@@ -1247,9 +1365,10 @@ void sdr_pvt_solstr(sdr_pvt_t *pvt, char *buff, int size)
         time2str(pvt->time, tstr, 1);
     }
     sdr_mutex_unlock(&pvt->mtx);
-    
+
     tstr[4] = tstr[7] = '-';
     snprintf(nstr, sizeof(nstr), "%d/%d", pvt->sol->ns, pvt->nsat);
     snprintf(buff, size, "%21s %12.8f %13.8f %9.3f %5s %s", tstr, pos[0] * R2D,
-        pos[1] * R2D, pos[2], nstr, stat ? "FIX" : "---");
+        pos[1] * R2D, pos[2], nstr,
+        solq[stat >= 0 && stat < 8 ? stat : 0]);
 }

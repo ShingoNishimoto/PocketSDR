@@ -102,7 +102,7 @@
 #define QZS_EC_BETA 20.0            /* max beta angle for qzss Ec (deg) */
 
 /* number and index of states */
-#define NF(opt)     ((opt)->ionoopt==IONOOPT_IFLC?1:(opt)->nf)
+#define NF(opt)     ((opt)->ionoopt==IONOOPT_IFLC||(opt)->ionoopt==IONOOPT_GRAPHIC?1:(opt)->nf)
 #define NP(opt)     ((opt)->dynamics?9:3)
 #define NC(opt)     (NSYS)
 #define NT(opt)     ((opt)->tropopt<TROPOPT_EST?0:((opt)->tropopt==TROPOPT_EST?1:3))
@@ -332,6 +332,7 @@ static double varerr(int sat, int sys, double el, int idx, int type,
         if (idx==2) fact*=EFACT_GPS_L5; /* GPS/QZS L5 error factor */
     }
     if (opt->ionoopt==IONOOPT_IFLC) fact*=3.0;
+    else if (opt->ionoopt==IONOOPT_GRAPHIC) fact*=opt->eratio[0]*0.5; /* σ_G = σ_code/2 */
     return SQR(fact*opt->err[1])+SQR(fact*opt->err[2]/sinel);
 }
 /* initialize state and covariance -------------------------------------------*/
@@ -390,6 +391,12 @@ static void corr_meas(const obsd_t *obs, const nav_t *nav, const double *azel,
             if (obs->code[i]==CODE_L1C) P[i]+=nav->cbias[obs->sat-1][1];
             if (obs->code[i]==CODE_L2C) P[i]+=nav->cbias[obs->sat-1][2];
         }
+    }
+    /* GRAPHIC linear combination: G = (P[0]+L[0])/2, iono cancels */
+    if (opt->ionoopt==IONOOPT_GRAPHIC) {
+        *Lc=(L[0]!=0.0&&P[0]!=0.0)?(P[0]+L[0])/2.0:0.0;
+        *Pc=0.0;
+        return;
     }
     /* iono-free LC */
     *Lc=*Pc=0.0;
@@ -689,6 +696,13 @@ static void udbias_ppp(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
                 bias[i]=Lc-Pc;
                 slip[i]=rtk->ssat[sat-1].slip[0]||rtk->ssat[sat-1].slip[1];
             }
+            else if (rtk->opt.ionoopt==IONOOPT_GRAPHIC) {
+                /* init bias as G - P = (L-P)/2 ≈ λN/2 - I */
+                if (Lc!=0.0&&P[0]!=0.0) {
+                    bias[i]=Lc-P[0];
+                    slip[i]=rtk->ssat[sat-1].slip[0];
+                }
+            }
             else if (L[f]!=0.0&&P[f]!=0.0) {
                 freq1=sat2freq(sat,obs[i].code[0],nav);
                 freq2=sat2freq(sat,obs[i].code[f],nav);
@@ -882,39 +896,52 @@ static int ppp_res(int post, const obsd_t *obs, int n, const double *rs,
         
         if ((r=geodist(rs+i*6,rr,e))<=0.0||
             satazel(pos,e,azel+i*2)<opt->elmin) {
+            trace(2,"ppp_res (%d) skip sat=%2d geodist=%.1f el=%.1f\n",
+                  post,sat,r,satazel(pos,e,azel+i*2)*R2D);
             exc[i]=1;
             continue;
         }
         if (!(sys=satsys(sat,NULL))||!rtk->ssat[sat-1].vs||
             satexclude(obs[i].sat,var_rs[i],svh[i],opt)||exc[i]) {
+            trace(2,"ppp_res (%d) skip sat=%2d sys=%d vs=%d svh=%d exc=%d\n",
+                  post,sat,sys,rtk->ssat[sat-1].vs,svh[i],exc[i]);
             exc[i]=1;
             continue;
         }
         /* tropospheric and ionospheric model */
         if (!model_trop(obs[i].time,pos,azel+i*2,opt,x,dtdx,nav,&dtrp,&vart)||
             !model_iono(obs[i].time,pos,azel+i*2,opt,sat,x,nav,&dion,&vari)) {
+            trace(2,"ppp_res (%d) skip sat=%2d trop/iono model failed\n",post,sat);
             continue;
         }
         /* satellite and receiver antenna model */
         if (opt->posopt[0]) satantpcv(rs+i*6,rr,nav->pcvs+sat-1,dants);
         antmodel(opt->pcvr,opt->antdel[0],azel+i*2,opt->posopt[1],dantr);
-        
+
         /* phase windup model */
         if (!model_phw(rtk->sol.time,sat,nav->pcvs[sat-1].type,
                        opt->posopt[2]?2:0,rs+i*6,rr,&rtk->ssat[sat-1].phw)) {
+            trace(2,"ppp_res (%d) skip sat=%2d phw model failed\n",post,sat);
             continue;
         }
         /* corrected phase and code measurements */
         corr_meas(obs+i,nav,azel+i*2,&rtk->opt,dantr,dants,
                   rtk->ssat[sat-1].phw,L,P,&Lc,&Pc);
-        
+        trace(2,"ppp_res (%d) sat=%2d code0=%d code1=%d P0=%.1f P1=%.1f L0=%.1f L1=%.1f Lc=%.1f Pc=%.1f\n",
+              post,sat,obs[i].code[0],obs[i].code[1],obs[i].P[0],obs[i].P[1],
+              obs[i].L[0],obs[i].L[1],Lc,Pc);
+
         /* stack phase and code residuals {L1,P1,L2,P2,...} */
         for (j=0;j<2*NF(opt);j++) {
-            
+
             dcb=bias=0.0;
-            
-            if (opt->ionoopt==IONOOPT_IFLC) {
-                if ((y=j%2==0?Lc:Pc)==0.0) continue;
+
+            if (opt->ionoopt==IONOOPT_IFLC||opt->ionoopt==IONOOPT_GRAPHIC) {
+                if ((y=j%2==0?Lc:Pc)==0.0) {
+                    trace(2,"ppp_res (%d) skip sat=%2d j=%d y=0 (Lc=%.1f Pc=%.1f)\n",
+                          post,sat,j,Lc,Pc);
+                    continue;
+                }
             }
             else {
                 if ((y=j%2==0?L[j/2]:P[j/2])==0.0) continue;
@@ -949,7 +976,11 @@ static int ppp_res(int post, const obsd_t *obs, int n, const double *rs,
                 H[ID(opt)+nx*nv]=1.0;
             }
             if (j%2==0) { /* phase bias */
-                if ((bias=x[IB(sat,j/2,opt)])==0.0) continue;
+                if ((bias=x[IB(sat,j/2,opt)])==0.0) {
+                    trace(2,"ppp_res (%d) skip sat=%2d j=%d bias=0 IB=%d\n",
+                          post,sat,j,IB(sat,j/2,opt));
+                    continue;
+                }
                 H[IB(sat,j/2,opt)+nx*nv]=1.0;
             }
             /* residual */

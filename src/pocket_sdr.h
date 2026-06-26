@@ -268,6 +268,7 @@ typedef struct {                // SDR PVT type
     sol_t *sol;                 // PVT solution
     ssat_t *ssat;               // satellite status
     rtcm_t *rtcm;               // RTCM control
+    rtk_t *rtk;                 // RTK/PPP state (NULL: SPP mode)
     double latency;             // solution latency (s)
     int count[3];               // solution, OBS and NAV count
     struct sdr_rcv_tag *rcv;    // pointer to SDR receiver
