@@ -1,189 +1,398 @@
 #!/usr/bin/env python3
 #
-#  Pocket SDR - Position Solution Visualizer
+#  pocket_pos_plot.py - PocketSDR position accuracy evaluator
 #
-#  Reads $POS entries from a pocket_trk log file and plots:
-#    - Latitude / Longitude / Height time series
-#    - Horizontal scatter (deviation from reference)
-#    - Solution quality and standard deviation over time
+#  Reads $POS entries from pocket_trk log file(s) OR RTKLIB .pos files,
+#  computes N/E/U errors relative to a known reference position, and plots:
+#    - Height convergence with +/-1sigma band and reference line
+#    - North / East / Up error time series with formal +/-sigma envelope
+#    - Horizontal position scatter
+#    - Formal standard deviation (sigmaN, sigmaE, sigmaU) over time
+#  Prints mean, std, and RMS per component to the terminal.
+#
+#  File format is auto-detected:
+#    pocket.log  — lines starting with $POS (pocket_trk output)
+#    *.pos       — RTKLIB rnx2rtkp / rtkpost LLH output (date time lat lon hgt Q ...)
 #
 #  Usage:
-#    python3 pocket_pos_plot.py <logfile> [options]
+#    python3 pocket_pos_plot.py <file> [file2 ...] [options]
 #
-#  Options:
-#    --ref LAT,LON,HGT   known reference position (deg, deg, m)
-#    --ppp-only          show only PPP (Q=6) epochs
-#    --out PNGFILE       save figure instead of displaying
+#  Reference position options (at least one required for error evaluation):
+#    --ref LAT LON HGT   WGS-84 ellipsoidal (deg deg m)
+#    --ahd LAT LON AHD N AHD orthometric height + geoid undulation N (m);
+#                         WGS-84 hgt = AHD + N + ant.  Obtain N from
+#                         Geoscience Australia AUSGeoid2020 online tool.
+#  Other options:
+#    --ant H              antenna height above ground reference point (m)
+#    --ppp-only           include only PPP/FIX (Q=6 for PPP, Q=1 for RTK-FIX)
+#    --after T            statistics window: only T seconds after first PPP/FIX
+#    --out FILE           save figure to PNG instead of displaying
 #
-import sys, argparse
+import sys, argparse, os
+from datetime import datetime, timezone
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.lines import Line2D
 
-SOLQ_LABEL = {0:'---', 1:'FIX', 2:'FLT', 3:'SBS', 4:'DGP', 5:'SPP', 6:'PPP', 7:'DR'}
-SOLQ_COLOR = {0:'gray', 1:'blue', 2:'cyan', 3:'magenta', 4:'orange', 5:'green', 6:'red', 7:'purple'}
+_WGS84_A  = 6378137.0
+_WGS84_E2 = 2 / 298.257223563 - (1 / 298.257223563) ** 2
 
-def parse_log(path):
-    """Parse $POS lines; return structured array."""
+SOLQ_LABEL  = {0:'---', 1:'FIX', 2:'FLT', 3:'SBS', 4:'DGP',
+               5:'SPP', 6:'PPP', 7:'DR'}
+SOLQ_COLOR  = {0:'gray',    1:'blue',   2:'cyan',  3:'magenta',
+               4:'orange',  5:'green',  6:'red',   7:'purple'}
+FILE_COLORS = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red',
+               'tab:purple', 'tab:brown', 'tab:pink',  'tab:olive']
+
+_DTYPE = [('t','f8'), ('lat','f8'), ('lon','f8'), ('hgt','f8'),
+          ('q','i4'), ('ns','i4'),
+          ('stdn','f8'), ('stde','f8'), ('stdu','f8')]
+
+# ── parsing ────────────────────────────────────────────────────────────────────
+
+def _parse_pocket_log(path):
+    """Parse $POS records from a pocket_trk log file."""
     rows = []
-    with open(path) as f:
+    with open(path, errors='replace') as f:
         for line in f:
             if not line.startswith('$POS,'):
                 continue
-            parts = line.strip().split(',')
-            if len(parts) < 17:
+            p = line.strip().split(',')
+            if len(p) < 17:
                 continue
             try:
-                t    = float(parts[1])
-                lat  = float(parts[8])
-                lon  = float(parts[9])
-                hgt  = float(parts[10])
-                q    = int(parts[11])
-                ns   = int(parts[12])
-                stdn = float(parts[13])
-                stde = float(parts[14])
-                stdu = float(parts[15])
-                dtr  = float(parts[16])
-                rows.append((t, lat, lon, hgt, q, ns, stdn, stde, stdu, dtr))
+                rows.append((
+                    float(p[1]),
+                    float(p[8]), float(p[9]), float(p[10]),
+                    int(p[11]),  int(p[12]),
+                    float(p[13]), float(p[14]), float(p[15]),
+                ))
             except (ValueError, IndexError):
                 continue
-    dtype = [('t','f8'),('lat','f8'),('lon','f8'),('hgt','f8'),
-             ('q','i4'),('ns','i4'),('stdn','f8'),('stde','f8'),
-             ('stdu','f8'),('dtr','f8')]
-    return np.array(rows, dtype=dtype)
+    return np.array(rows, dtype=_DTYPE)
 
-def latlon_to_ne(lat, lon, lat0, lon0):
-    """Approximate N/E offset in metres from reference (lat0, lon0) in deg."""
-    R = 6378137.0
-    dlat = np.deg2rad(lat - lat0)
-    dlon = np.deg2rad(lon - lon0)
-    N = dlat * R
-    E = dlon * R * np.cos(np.deg2rad(lat0))
-    return N, E
+
+def _gpst_to_ts(date_str, time_str):
+    """Convert RTKLIB GPST 'YYYY/MM/DD HH:MM:SS.sss' to float Unix timestamp."""
+    dt = datetime.strptime(f'{date_str} {time_str}', '%Y/%m/%d %H:%M:%S.%f')
+    return dt.replace(tzinfo=timezone.utc).timestamp()
+
+
+def _parse_rtklib_pos(path):
+    """Parse RTKLIB rnx2rtkp/rtkpost LLH .pos file.
+
+    Expected (space-separated, lines not starting with %):
+      date  time  lat  lon  hgt  Q  ns  sdn  sde  sdu  ...
+    """
+    rows = []
+    with open(path, errors='replace') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('%') or line.startswith('#'):
+                continue
+            p = line.split()
+            if len(p) < 10:
+                continue
+            try:
+                t  = _gpst_to_ts(p[0], p[1])
+                rows.append((
+                    t,
+                    float(p[2]), float(p[3]), float(p[4]),
+                    int(p[5]),   int(p[6]),
+                    float(p[7]), float(p[8]), float(p[9]),
+                ))
+            except (ValueError, IndexError):
+                continue
+    return np.array(rows, dtype=_DTYPE)
+
+
+def _detect_format(path):
+    """Return 'pocket' or 'rtklib' based on file content."""
+    with open(path, errors='replace') as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith('$POS,'):
+                return 'pocket'
+            if line and not line.startswith('%') and not line.startswith('#'):
+                p = line.split()
+                if len(p) >= 10 and '/' in p[0] and ':' in p[1]:
+                    return 'rtklib'
+    return 'pocket'
+
+
+def parse_log(path):
+    """Return structured numpy array — auto-detects pocket.log vs RTKLIB .pos."""
+    fmt = _detect_format(path)
+    if fmt == 'rtklib':
+        data = _parse_rtklib_pos(path)
+        if len(data) > 0:
+            # Normalise t to seconds-from-start (same as pocket.log field p[1])
+            data['t'] = data['t'] - data['t'][0]
+        return data
+    return _parse_pocket_log(path)
+
+# ── geodesy ───────────────────────────────────────────────────────────────────
+
+def llh_to_ecef(lat_deg, lon_deg, hgt_m):
+    """WGS-84 geodetic (deg, deg, m) → ECEF (m), vectorised."""
+    lat = np.deg2rad(lat_deg)
+    lon = np.deg2rad(lon_deg)
+    N = _WGS84_A / np.sqrt(1.0 - _WGS84_E2 * np.sin(lat)**2)
+    X = (N + hgt_m) * np.cos(lat) * np.cos(lon)
+    Y = (N + hgt_m) * np.cos(lat) * np.sin(lon)
+    Z = (N * (1.0 - _WGS84_E2) + hgt_m) * np.sin(lat)
+    return X, Y, Z
+
+def ecef_to_neu(dx, dy, dz, lat0_deg, lon0_deg):
+    """ECEF delta → North/East/Up at reference (lat0, lon0), vectorised."""
+    phi = np.deg2rad(lat0_deg)
+    lam = np.deg2rad(lon0_deg)
+    sp, cp = np.sin(phi), np.cos(phi)
+    sl, cl = np.sin(lam), np.cos(lam)
+    n = -sp*cl*dx - sp*sl*dy + cp*dz
+    e = -sl*dx       + cl*dy
+    u =  cp*cl*dx + cp*sl*dy + sp*dz
+    return n, e, u
+
+def compute_neu(data, lat0, lon0, hgt0):
+    """Compute N/E/U errors (m) for all rows in data vs reference."""
+    X0, Y0, Z0 = llh_to_ecef(lat0, lon0, hgt0)
+    X, Y, Z = llh_to_ecef(data['lat'], data['lon'], data['hgt'])
+    return ecef_to_neu(X - X0, Y - Y0, Z - Z0, lat0, lon0)
+
+# ── statistics ────────────────────────────────────────────────────────────────
+
+def print_stats(label, Ne, Ee, Ue):
+    H2 = Ne**2 + Ee**2
+    P2 = H2 + Ue**2
+    hdr = f'{"":16s} {"N (m)":>9s} {"E (m)":>9s} {"U (m)":>9s}' \
+          f' {"H2D (m)":>9s} {"3D (m)":>9s}'
+    mean_row = (f'{"Mean (bias)":16s} {np.mean(Ne):+9.3f} {np.mean(Ee):+9.3f}'
+                f' {np.mean(Ue):+9.3f}')
+    std_row  = (f'{"Std (1sigma)":16s} {np.std(Ne):9.3f}  {np.std(Ee):9.3f}'
+                f'  {np.std(Ue):9.3f}')
+    rms_row  = (f'{"RMS":16s} {np.sqrt(np.mean(Ne**2)):9.3f}'
+                f'  {np.sqrt(np.mean(Ee**2)):9.3f}'
+                f'  {np.sqrt(np.mean(Ue**2)):9.3f}'
+                f'  {np.sqrt(np.mean(H2)):9.3f}'
+                f'  {np.sqrt(np.mean(P2)):9.3f}')
+    print(f'\n{label}  (n = {len(Ne)})')
+    print(hdr)
+    print(mean_row)
+    print(std_row)
+    print(rms_row)
+
+# ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser(description='Pocket SDR position log visualizer')
-    ap.add_argument('logfile', help='pocket_trk log file')
-    ap.add_argument('--ref', default=None,
-                    help='reference position LAT,LON,HGT (deg,deg,m)')
+    ap = argparse.ArgumentParser(description='PocketSDR position accuracy evaluator')
+    ap.add_argument('logfiles', nargs='+', help='pocket_trk log file(s)')
+    ap.add_argument('--ref', nargs=3, type=float,
+                    metavar=('LAT', 'LON', 'HGT'),
+                    help='WGS-84 reference: LAT LON HGT (deg deg m ellipsoidal)')
+    ap.add_argument('--ahd', nargs=4, type=float,
+                    metavar=('LAT', 'LON', 'AHD', 'N'),
+                    help='AHD reference: LAT LON AHD N  (WGS-84 = AHD+N+ant)')
+    ap.add_argument('--ant', type=float, default=0.0,
+                    help='antenna height above ground reference point (m, default 0)')
     ap.add_argument('--ppp-only', action='store_true',
-                    help='show only PPP (Q=6) epochs')
+                    help='include only best-quality epochs: Q=6 (PPP) or Q=1 (RTK-FIX)')
+    ap.add_argument('--after', type=float, default=0.0,
+                    help='statistics window: seconds after first PPP epoch (default=all)')
     ap.add_argument('--out', default=None, help='save figure to PNG file')
     args = ap.parse_args()
 
-    data = parse_log(args.logfile)
-    if len(data) == 0:
-        print('No $POS records found in', args.logfile)
+    # ── resolve reference position ────────────────────────────────────────────
+    lat0 = lon0 = hgt0 = None
+
+    if args.ref:
+        lat0, lon0, hgt0 = args.ref
+        if args.ant != 0.0:
+            print(f'Note: --ant {args.ant} m ignored for --ref (HGT should '
+                  'already be at antenna phase centre)')
+
+    elif args.ahd:
+        lat0, lon0, ahd, N_geoid = args.ahd
+        hgt0 = ahd + N_geoid + args.ant
+        print(f'Reference: {lat0:.7f}  {lon0:.7f}')
+        print(f'  AHD {ahd:.3f} m + geoid N {N_geoid:.3f} m'
+              f' + ant {args.ant:.3f} m = {hgt0:.3f} m WGS-84 ellipsoidal')
+
+    have_ref = (lat0 is not None)
+
+    # ── load data ─────────────────────────────────────────────────────────────
+    datasets = []
+    for path in args.logfiles:
+        d = parse_log(path)
+        if len(d) == 0:
+            print(f'Warning: no $POS records in {path}')
+            continue
+        if args.ppp_only:
+            d = d[(d['q'] == 6) | (d['q'] == 1)]  # PPP or RTK-FIX
+            if len(d) == 0:
+                print(f'Warning: no PPP/FIX epochs in {path}')
+                continue
+        datasets.append((os.path.basename(path), d))
+
+    if not datasets:
+        print('No valid data.')
         sys.exit(1)
 
-    if args.ppp_only:
-        data = data[data['q'] == 6]
-        if len(data) == 0:
-            print('No PPP (Q=6) epochs found.')
-            sys.exit(1)
+    if not have_ref:
+        d0 = datasets[0][1]
+        ppp = d0[d0['q'] == 6]
+        ref_data = ppp if len(ppp) > 0 else d0
+        lat0 = float(np.mean(ref_data['lat']))
+        lon0 = float(np.mean(ref_data['lon']))
+        hgt0 = float(np.mean(ref_data['hgt']))
+        print('No reference given — using mean of first file:')
+        print(f'  lat={lat0:.9f}  lon={lon0:.9f}  hgt={hgt0:.3f} m WGS-84')
 
-    # reference position
-    if args.ref:
-        try:
-            ref = [float(x) for x in args.ref.split(',')]
-            lat0, lon0, hgt0 = ref
-        except Exception:
-            print('--ref format: LAT,LON,HGT'); sys.exit(1)
-    else:
-        # use mean of all valid epochs as reference
-        lat0 = np.mean(data['lat'])
-        lon0 = np.mean(data['lon'])
-        hgt0 = np.mean(data['hgt'])
-        print(f'Reference (mean): {lat0:.9f}  {lon0:.9f}  {hgt0:.3f}')
+    # ── figure layout ─────────────────────────────────────────────────────────
+    multi = len(datasets) > 1
+    title = ', '.join(n for n, _ in datasets)
+    fig = plt.figure(figsize=(14, 12))
+    fig.suptitle(f'PocketSDR Position Accuracy — {title}', fontsize=11)
 
-    t = (data['t'] - data['t'][0]) / 60.0  # minutes from start
-    N, E = latlon_to_ne(data['lat'], data['lon'], lat0, lon0)
-    U = data['hgt'] - hgt0
+    gs = gridspec.GridSpec(4, 2, figure=fig,
+                           hspace=0.50, wspace=0.32,
+                           height_ratios=[1.5, 1, 1, 1])
+    ax_h   = fig.add_subplot(gs[0, 0])         # Height convergence (absolute)
+    ax_n   = fig.add_subplot(gs[1, 0])         # North error
+    ax_e   = fig.add_subplot(gs[2, 0])         # East error
+    ax_u   = fig.add_subplot(gs[3, 0])         # Up error
+    ax_ne  = fig.add_subplot(gs[0:2, 1],       # Horizontal scatter
+                             aspect='equal')
+    ax_std = fig.add_subplot(gs[2:4, 1])       # Formal sigma time series
 
-    q_vals = np.unique(data['q'])
+    # ── per-dataset plotting ──────────────────────────────────────────────────
+    for idx, (name, data) in enumerate(datasets):
+        fcolor = FILE_COLORS[idx % len(FILE_COLORS)]
+        t = (data['t'] - data['t'][0]) / 60.0      # minutes from session start
+        Ne, Ee, Ue = compute_neu(data, lat0, lon0, hgt0)
+        q_vals = np.unique(data['q'])
 
-    # ── layout ─────────────────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(14, 10))
-    fig.suptitle(f'PocketSDR Position Solution — {args.logfile}', fontsize=12)
-    gs = gridspec.GridSpec(3, 2, figure=fig, hspace=0.42, wspace=0.35)
-
-    ax_n   = fig.add_subplot(gs[0, 0])
-    ax_e   = fig.add_subplot(gs[1, 0])
-    ax_u   = fig.add_subplot(gs[2, 0])
-    ax_ne  = fig.add_subplot(gs[0:2, 1], aspect='equal')
-    ax_std = fig.add_subplot(gs[2, 1])
-
-    def scatter_by_q(ax, x, y, **kw):
+        # Height convergence: absolute height with +/-1 sigmaU shading
+        ax_h.fill_between(t, data['hgt'] - data['stdu'],
+                             data['hgt'] + data['stdu'],
+                          alpha=0.2, color=fcolor)
         for q in q_vals:
             m = data['q'] == q
-            ax.scatter(x[m], y[m], s=4, c=SOLQ_COLOR.get(q,'gray'),
-                       label=SOLQ_LABEL.get(q, str(q)), **kw)
+            c   = fcolor if multi else SOLQ_COLOR.get(q, 'gray')
+            lbl = (f'{name} ' if multi else '') + SOLQ_LABEL.get(q, str(q))
+            ax_h.scatter(t[m], data['hgt'][m], s=3, c=c, label=lbl, zorder=3)
 
-    # N, E, U time series
-    for ax, series, ylabel in [
-            (ax_n, N, 'North (m)'),
-            (ax_e, E, 'East (m)'),
-            (ax_u, U, 'Up (m)')]:
-        scatter_by_q(ax, t, series)
-        ax.axhline(0, color='k', lw=0.5, ls='--')
+        # N / E / U error time series with formal sigma shading
+        for ax, err, std_key in [(ax_n, Ne, 'stdn'),
+                                  (ax_e, Ee, 'stde'),
+                                  (ax_u, Ue, 'stdu')]:
+            sig = data[std_key]
+            ax.fill_between(t, -sig, +sig, alpha=0.15, color='gray')
+            for q in q_vals:
+                m = data['q'] == q
+                c = fcolor if multi else SOLQ_COLOR.get(q, 'gray')
+                ax.scatter(t[m], err[m], s=3, c=c, zorder=3)
+
+        # Horizontal scatter
+        for q in q_vals:
+            m = data['q'] == q
+            c   = fcolor if multi else SOLQ_COLOR.get(q, 'gray')
+            lbl = (f'{name} ' if multi else '') + SOLQ_LABEL.get(q, str(q))
+            ax_ne.scatter(Ee[m], Ne[m], s=5, c=c, label=lbl, zorder=3)
+
+        # Formal sigma time series
+        ls = ['-', '--', ':', '-.'][idx % 4]
+        pfx = f'{name} ' if multi else ''
+        ax_std.plot(t, data['stdn'], ls=ls, color='C0', lw=0.9,
+                    label=f'{pfx}sigmaN')
+        ax_std.plot(t, data['stde'], ls=ls, color='C1', lw=0.9,
+                    label=f'{pfx}sigmaE')
+        ax_std.plot(t, data['stdu'], ls=ls, color='C2', lw=0.9,
+                    label=f'{pfx}sigmaU')
+
+        # Statistics: best-quality epochs (PPP Q=6, or RTK-FIX Q=1)
+        fix_mask = (data['q'] == 6) | (data['q'] == 1)   # PPP or RTK-FIX
+        ppp_mask = data['q'] == 6                          # PPP only (for label)
+        n_total  = len(data)
+        n_fix    = int(np.sum(fix_mask))
+        n_spp    = int(np.sum(data['q'] == 5))
+        fix_label = 'PPP' if np.any(ppp_mask) else 'FIX'
+        print(f'\n{name}: {n_total} epochs  '
+              f'SPP={n_spp}  {fix_label}={n_fix} ({100*n_fix/n_total:.1f}%)')
+
+        if np.any(fix_mask):
+            t0_ppp   = data['t'][np.argmax(fix_mask)]
+            stat_mask = fix_mask
+            stat_label = f'{name} — {fix_label} all'
+            if args.after > 0:
+                stat_mask = fix_mask & (data['t'] >= t0_ppp + args.after)
+                stat_label = f'{name} — {fix_label} after {args.after:.0f} s'
+                # mark the cutoff on time-series panels
+                t_cut = (t0_ppp + args.after - data['t'][0]) / 60.0
+                for ax in (ax_h, ax_n, ax_e, ax_u):
+                    ax.axvline(t_cut, color='k', lw=0.7, ls=':', alpha=0.5)
+            if np.sum(stat_mask) > 0:
+                print_stats(stat_label,
+                            Ne[stat_mask], Ee[stat_mask], Ue[stat_mask])
+            else:
+                print(f'  (no epochs in stats window — '
+                      'try reducing --after or check PPP coverage)')
+        else:
+            print_stats(f'{name} — all epochs', Ne, Ee, Ue)
+
+    # ── axes decoration ───────────────────────────────────────────────────────
+    if have_ref:
+        ax_h.axhline(hgt0, color='k', lw=1.2, ls='--',
+                     label=f'reference {hgt0:.2f} m', zorder=4)
+    ax_h.set_ylabel('Height WGS-84 (m)')
+    ax_h.set_xlabel('Time (min)')
+    ax_h.set_title('Height convergence  (shading = ±1σU)')
+    ax_h.grid(True, ls=':', lw=0.5)
+    ax_h.legend(fontsize=7, loc='upper right')
+
+    for ax, ylabel, std_sym in [(ax_n, 'North error (m)', 'σN'),
+                                 (ax_e, 'East error (m)',  'σE'),
+                                 (ax_u, 'Up error (m)',    'σU')]:
+        ax.axhline(0, color='k', lw=0.8, ls='--')
         ax.set_ylabel(ylabel)
         ax.set_xlabel('Time (min)')
         ax.grid(True, ls=':', lw=0.5)
-        rms = np.sqrt(np.mean(series**2))
-        ax.set_title(f'RMS {rms:.3f} m', fontsize=9)
+        ax.text(0.01, 0.97, f'shading = ±{std_sym}',
+                transform=ax.transAxes, fontsize=7, va='top', color='gray')
 
-    # Horizontal scatter
-    scatter_by_q(ax_ne, E, N)
     ax_ne.axhline(0, color='k', lw=0.5, ls='--')
     ax_ne.axvline(0, color='k', lw=0.5, ls='--')
-    ax_ne.set_xlabel('East (m)')
-    ax_ne.set_ylabel('North (m)')
+    ax_ne.set_xlabel('East error (m)')
+    ax_ne.set_ylabel('North error (m)')
     ax_ne.set_title('Horizontal scatter')
     ax_ne.grid(True, ls=':', lw=0.5)
-    hrms = np.sqrt(np.mean(N**2 + E**2))
-    ax_ne.set_title(f'Horizontal scatter  (HRMS={hrms:.3f} m)')
 
-    # Standard deviation over time
-    ax_std.plot(t, data['stdn'], label='σN', lw=0.8)
-    ax_std.plot(t, data['stde'], label='σE', lw=0.8)
-    ax_std.plot(t, data['stdu'], label='σU', lw=0.8)
     ax_std.set_xlabel('Time (min)')
-    ax_std.set_ylabel('Std dev (m)')
-    ax_std.set_title('Formal accuracy (σ)')
-    ax_std.legend(fontsize=8, loc='upper right')
+    ax_std.set_ylabel('Formal std dev (m)')
+    ax_std.set_title('Formal accuracy  (σN, σE, σU)')
     ax_std.set_ylim(bottom=0)
+    ax_std.legend(fontsize=7, loc='upper right')
     ax_std.grid(True, ls=':', lw=0.5)
 
-    # Legend for solution quality
-    legend_handles = [Line2D([0],[0], marker='o', color='w',
-                             markerfacecolor=SOLQ_COLOR.get(q,'gray'),
-                             markersize=6, label=SOLQ_LABEL.get(q,str(q)))
-                      for q in q_vals]
-    fig.legend(handles=legend_handles, title='Quality', loc='lower center',
-               ncol=len(q_vals), fontsize=9, frameon=True,
-               bbox_to_anchor=(0.5, 0.01))
-
-    # Summary text
-    total = len(data)
-    ppp_n = np.sum(data['q'] == 6)
-    spp_n = np.sum(data['q'] == 5)
-    print(f'Epochs: {total}  SPP: {spp_n}  PPP: {ppp_n}  ({100*ppp_n/total:.1f}% PPP)')
-    print(f'N  RMS={np.sqrt(np.mean(N**2)):.3f} m  '
-          f'E  RMS={np.sqrt(np.mean(E**2)):.3f} m  '
-          f'U  RMS={np.sqrt(np.mean(U**2)):.3f} m')
-    if ppp_n > 0:
-        ppp = data[data['q']==6]
-        Np, Ep = latlon_to_ne(ppp['lat'], ppp['lon'], lat0, lon0)
-        Up = ppp['hgt'] - hgt0
-        print(f'PPP only — N RMS={np.sqrt(np.mean(Np**2)):.3f} m  '
-              f'E RMS={np.sqrt(np.mean(Ep**2)):.3f} m  '
-              f'U RMS={np.sqrt(np.mean(Up**2)):.3f} m')
+    # Solution quality legend (single-file only; multi-file uses ax_h legend)
+    if not multi:
+        _, data = datasets[0]
+        q_vals = np.unique(data['q'])
+        handles = [Line2D([0], [0], marker='o', color='w',
+                          markerfacecolor=SOLQ_COLOR.get(q, 'gray'),
+                          markersize=6, label=SOLQ_LABEL.get(q, str(q)))
+                   for q in q_vals]
+        fig.legend(handles=handles, title='Solution Q', loc='lower center',
+                   ncol=len(q_vals), fontsize=9, frameon=True,
+                   bbox_to_anchor=(0.5, 0.005))
+    else:
+        ax_ne.legend(fontsize=7, loc='upper right')
 
     if args.out:
         plt.savefig(args.out, dpi=150, bbox_inches='tight')
-        print('saved:', args.out)
+        print(f'\nFigure saved: {args.out}')
     else:
         plt.show()
 

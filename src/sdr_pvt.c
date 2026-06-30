@@ -35,6 +35,13 @@ double sdr_lag_epoch = LAG_EPOCH;
 double sdr_el_mask   = EL_MASK;
 int    sdr_ionoopt   = IONOOPT_BRDC;
 int    sdr_pmode     = PMODE_SINGLE;
+double sdr_fixpos[3] = {0.0};  // known ECEF position for fixed-position mode (m)
+int    sdr_ps_prn      = 0;     // pseudo-satellite PRN for AOWR time-transfer (0: disabled)
+double sdr_ps_dist     = 0.6;   // true distance to pseudo-sat transmitter (m)
+double sdr_ps_freq_err = 0.0;   // PS transmitter LO frequency error (Hz), e.g. -7.15e-3 for bladeRF
+int    sdr_dynamics  = 0;      // enable dynamics model for kinematic PPP
+double sdr_prnaccelh = -1.0;   // horizontal acceleration process noise (m/s²), <0 = use RTKLIB default
+double sdr_prnaccv   = -1.0;   // vertical acceleration process noise (m/s²), <0 = use RTKLIB default
 static const int systems[] = {
     SYS_GPS, SYS_GLO, SYS_GAL, SYS_QZS, SYS_CMP, SYS_IRN, SYS_SBS, 0
 };
@@ -188,17 +195,22 @@ static void out_log_obs(double time, const obs_t *obs, const nav_t *nav)
 //          lat   solution latitude (deg, +:north, -:south)
 //          lon   solution longitude (deg, +:east, -:west)
 //          hgt   solution ellipsoidal height (m)
-//          Q     quality flag (=5: single)
+//          Q     quality flag (=5: single, =6: PPP)
 //          ns    number of valid satellites
 //          stdn  solution standard deviation north (m)
 //          stde  solution standard deviation east (m)
 //          stdu  solution standard deviation up (m)
 //          dtr   receiver clock bias (s)
+//          x,y,z ECEF position (m)
+//          vx,vy,vz ECEF velocity (m/s, non-zero only in kinematic mode)
 //
 static void out_log_pos(double time, const sol_t *sol, int nsat)
 {
     double ep[6], pos[3], P[9], Q[9];
-    time2epoch(timeadd(sol->time, sol->dtr[0]), ep);
+    /* In PPP mode, RTKLIB stores sol->dtr[0] = x[IC_GPS] in meters (not seconds).
+       Convert to seconds for time display and dtr field output. */
+    double dtr_s = (sdr_pmode >= PMODE_PPP_KINEMA) ? sol->dtr[0] / CLIGHT : sol->dtr[0];
+    time2epoch(timeadd(sol->time, dtr_s), ep);
     ecef2pos(sol->rr, pos);
     P[0] = sol->qr[0];
     P[4] = sol->qr[1];
@@ -208,9 +220,12 @@ static void out_log_pos(double time, const sol_t *sol, int nsat)
     P[2] = P[6] = sol->qr[5];
     covenu(pos, P, Q);
     sdr_log(3, "$POS,%.3f,%.0f,%.0f,%.0f,%.0f,%.0f,%.3f,%.9f,%.9f,%.3f,%d,%d,"
-        "%.3f,%.3f,%.3f,%.9f", time, ep[0], ep[1], ep[2], ep[3], ep[4], ep[5],
+        "%.3f,%.3f,%.3f,%.9f,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f",
+        time, ep[0], ep[1], ep[2], ep[3], ep[4], ep[5],
         pos[0] * R2D, pos[1] * R2D, pos[2], sol->stat, sol->ns, SQRT(Q[4]),
-        SQRT(Q[0]), SQRT(Q[8]), sol->dtr[0]);
+        SQRT(Q[0]), SQRT(Q[8]), dtr_s,
+        sol->rr[0], sol->rr[1], sol->rr[2],
+        sol->rr[3], sol->rr[4], sol->rr[5]);
 }
 
 //------------------------------------------------------------------------------
@@ -703,8 +718,19 @@ sdr_pvt_t *sdr_pvt_new(sdr_rcv_t *rcv)
         opt.navsys  = SYS_GPS | SYS_GLO | SYS_GAL | SYS_QZS | SYS_CMP | SYS_IRN;
         opt.ionoopt = (sdr_ionoopt==IONOOPT_GRAPHIC) ? IONOOPT_GRAPHIC : IONOOPT_IFLC;
         opt.tropopt = TROPOPT_ESTG;
-        if (sdr_ionoopt==IONOOPT_GRAPHIC) opt.modear = ARMODE_OFF; /* float bias only */
+        opt.maxinno = 100.0; /* relax outlier gate: default 30m too tight during PPP convergence */
+        if (sdr_ionoopt==IONOOPT_GRAPHIC) {
+            opt.modear = ARMODE_OFF; /* float bias only */
+        }
         opt.elmin   = sdr_el_mask * D2R;
+        opt.dynamics = sdr_dynamics;
+        if (sdr_prnaccelh >= 0.0) opt.prn[3] = sdr_prnaccelh;
+        if (sdr_prnaccv   >= 0.0) opt.prn[4] = sdr_prnaccv;
+        if (sdr_pmode == PMODE_PPP_FIXED) {
+            opt.ru[0] = sdr_fixpos[0];
+            opt.ru[1] = sdr_fixpos[1];
+            opt.ru[2] = sdr_fixpos[2];
+        }
         pvt->rtk = (rtk_t *)sdr_malloc(sizeof(rtk_t));
         rtkinit(pvt->rtk, &opt);
     }
@@ -718,6 +744,56 @@ sdr_pvt_t *sdr_pvt_new(sdr_rcv_t *rcv)
 //------------------------------------------------------------------------------
 //  Free a SDR PVT.
 //
+// Load precise navigation file (SP3 orbit or RINEX CLK) into pvt->nav. -------
+// Called from pocket_trk.c after receiver open, before data arrives.
+// Multiple calls are allowed: load SP3 first, then CLK for higher clock rate.
+//
+// Supported extensions (case-insensitive):
+//   .sp3 .eph → precise orbit (+ coarse 15-min clock embedded in SP3)
+//   .clk .clk_05s .clk_15s .clk_30s .clk_30 → RINEX clock (high-rate)
+//
+// When an SP3 file is loaded, rtk->opt.sateph is set to EPHOPT_PREC so
+// pppos() interpolates the SP3 orbit instead of using broadcast ephemeris.
+//
+void sdr_pvt_loadnav(sdr_pvt_t *pvt, const char *file)
+{
+    if (!pvt || !file || !*file) return;
+
+    // lowercase copy of the filename for extension matching
+    char lc[2048];
+    int k = 0;
+    for (const char *p = file; *p && k < (int)sizeof(lc) - 1; p++)
+        lc[k++] = tolower((unsigned char)*p);
+    lc[k] = '\0';
+
+    int is_sp3 = (strstr(lc, ".sp3") || strstr(lc, ".eph")) ? 1 : 0;
+    int is_clk = strstr(lc, ".clk") ? 1 : 0;
+
+    if (is_sp3) {
+        int ne_before = pvt->nav->ne;
+        readsp3(file, pvt->nav, 0);
+        int ne_loaded = pvt->nav->ne - ne_before;
+        if (ne_loaded > 0) {
+            if (pvt->rtk) pvt->rtk->opt.sateph = EPHOPT_PREC;
+            sdr_log(3, "$LOG,0.000,SP3 LOADED: %s (%d orbit epochs, sateph=PREC)",
+                file, ne_loaded);
+        } else {
+            fprintf(stderr, "SP3 load failed or empty: %s\n", file);
+        }
+    } else if (is_clk) {
+        int nc_before = pvt->nav->nc;
+        readrnxc(file, pvt->nav);
+        int nc_loaded = pvt->nav->nc - nc_before;
+        if (nc_loaded > 0) {
+            sdr_log(3, "$LOG,0.000,CLK LOADED: %s (%d clock epochs)", file, nc_loaded);
+        } else {
+            fprintf(stderr, "CLK load failed or empty: %s\n", file);
+        }
+    } else {
+        fprintf(stderr, "pocket_trk -nav: unrecognised file type: %s\n", file);
+    }
+}
+
 //  args:
 //      pvt      (I)  SDR PVT generated by sdr_pvt_new()
 //
@@ -834,6 +910,20 @@ static void update_obs(gtime_t time, obs_t *obs, sdr_ch_t *ch)
     obs->data[i].L[idx] = gen_cphas(ch, P);
     obs->data[i].D[idx] = (float)ch->fd;
     obs->data[i].SNR[idx] = (uint16_t)(ch->cn0 / SNR_UNIT + 0.5);
+
+    // Correct carrier phase and Doppler for non-zero IF offset.
+    // The PLL drives ch->fd = fd_satellite + fi (total baseband, not just Doppler)
+    // because phi = fi*tau + adr uses only the last-interval fi, forcing the PLL
+    // to fold cumulative fi into fd. Left uncorrected: GF drifts -0.91 m/s
+    // (false cycle slips every epoch), MW drifts +3.2 m/s, and Lc innovations
+    // grow 0.35 m/s — all preventing carrier-phase PPP.
+    // Fix: remove accumulated fi component from carrier phase and Doppler.
+    // Applies to any channel with non-zero IF (e.g. fi_L1=+1.831 Hz, fi_L2=-2.289 Hz
+    // for PocketSDR FE with external 10 MHz reference).
+    if (ch->fi != 0.0) {
+        obs->data[i].L[idx] += ch->fi * (ch->lock * ch->T);  // remove fi*t cycles
+        obs->data[i].D[idx] -= (float)ch->fi;                  // remove fi from Doppler
+    }
     if (ch->lock * ch->T <= 2.0 || fabs(ch->trk->err_phas) > 0.25) {
         obs->data[i].LLI[idx] |= 1; // PLL unlock
     }
@@ -841,6 +931,8 @@ static void update_obs(gtime_t time, obs_t *obs, sdr_ch_t *ch)
         obs->data[i].LLI[idx] |= 2; // half-cyc-amb unknown
     }
 }
+
+static void update_aowr(double time, gtime_t gtime, double P, double L);
 
 //------------------------------------------------------------------------------
 //  Update observation data.
@@ -856,7 +948,7 @@ static void update_obs(gtime_t time, obs_t *obs, sdr_ch_t *ch)
 void sdr_pvt_udobs(sdr_pvt_t *pvt, int64_t ix, sdr_ch_t *ch)
 {
     sdr_mutex_lock(&pvt->mtx);
-    
+
     if (pvt->ix <= 0) { // initialize epoch time and cycle
         init_epoch(pvt, ix, ch);
     }
@@ -874,6 +966,23 @@ void sdr_pvt_udobs(sdr_pvt_t *pvt, int64_t ix, sdr_ch_t *ch)
     
     if (log_now && ch->state == SDR_STATE_LOCK && ch->lock > 0) {
         out_log_ch(ch);
+    }
+    // 20 ms high-rate AOWR tick (50 Hz), independent of 1 Hz PVT epoch
+    if (sdr_ps_prn > 0 && pvt->ix > 0 && ix % 20 == 0) {
+        char ps_sat_id[16];
+        sdr_sat_id("L1CA", sdr_ps_prn, ps_sat_id);
+        if (!strcmp(ch->sat, ps_sat_id) && !strcmp(ch->sig, "L1CA") &&
+            ch->state == SDR_STATE_LOCK && ch->tow >= 0 && ch->tow_v > 0 &&
+            (ch->nav->fsync > 0 || ch->trk->sec_sync > 0)) {
+            gtime_t gt = timeadd(pvt->time, (ix - pvt->ix) * SDR_CYC);
+            double P = gen_prng(gt, ch);
+            if (P > 0.0) {
+                double L = gen_cphas(ch, P);
+                if (ch->fi != 0.0)         L += ch->fi         * (ch->lock * ch->T);
+                if (sdr_ps_freq_err != 0.0) L += sdr_ps_freq_err * (ch->lock * ch->T);
+                update_aowr(ix * SDR_CYC, gt, P, L);
+            }
+        }
     }
     sdr_mutex_unlock(&pvt->mtx);
 }
@@ -1098,6 +1207,110 @@ static void output_sol(sdr_pvt_t *pvt, double time)
     }
 }
 
+static void res_obs_amb(obs_t *obs, int sys, uint8_t code, double sec);
+
+//------------------------------------------------------------------------------
+//  Update AOWR inter-system time bias from pseudo-satellite observation.
+//  Implements the PR+CP time-transfer algorithm from rtklib_pvt_gs.cc:3069-3163.
+//
+//  format:
+//      $AOWR,time,year,month,day,hour,min,sec,prn,P,L,dt_raw,dt_pr,dt_cp,
+//          count,outlier
+//          time    receiver time (s)
+//          year,month,day,hour,min,sec  GPST epoch
+//          prn     pseudo-satellite PRN
+//          P       pseudorange (m)
+//          L       carrier phase (cycles)
+//          dt_raw  P/CLIGHT - raw propagation delay (s)
+//          dt_pr   smoothed PR-based GNSSR-AOWR time offset (s)
+//          dt_cp   carrier-phase enhanced GNSSR-AOWR time offset (s)
+//          count   valid (non-outlier) sample count
+//          outlier 1=outlier epoch, 0=valid epoch
+//
+static void update_aowr(double time, gtime_t gtime, double P, double L)
+{
+    static const double DT_DEV_THRESH   = 3.0 / CLIGHT; // 10 ns gate
+    static const int    DEV_COUNT_THRESH = 100;
+    static int     initialized   = 0;
+    static int64_t dt_int_s      = 0;
+    static double  dt_frac_sum   = 0.0;
+    static double  dt0_frac_sum  = 0.0;
+    static int     count         = 0;
+    static double  dt_aowr       = 0.0;
+    static double  dt_aowr_cp    = 0.0;
+    static double  cp_thresh     = 3.0 / CLIGHT;
+    static double  diff_total    = 0.0;
+    static int     dev_count     = 0;
+    static double  dt_new_frac_sum  = 0.0;
+    static int     dt_new_count     = 0;
+    static double  diff_new_total   = 0.0;
+    static double  initial_rx    = 0.0;
+    double dt_current  = P / CLIGHT;
+    double Ci          = L / FREQ1;   // carrier phase in light-seconds
+
+    if (!initialized) {
+        dt_int_s    = (int64_t)round(dt_current);
+        initial_rx  = time;
+        initialized = 1;
+    }
+
+    double dt0 = count > 0 ? (double)dt_int_s + dt0_frac_sum / count : 0.0;
+    double dt0_current = dt_current - sdr_ps_dist / CLIGHT - Ci;
+
+    int outlier = (dt_aowr != 0.0) &&
+        (fabs(dt_current - dt_aowr)     > DT_DEV_THRESH ||
+         fabs(dt0_current - dt0)        > DT_DEV_THRESH ||
+         fabs(dt0 + Ci - dt_aowr_cp)    > cp_thresh     ||
+         (time - initial_rx) > 40.0);
+
+    if (outlier) {
+        dev_count++;
+        dt_new_frac_sum += dt_current - (double)dt_int_s;
+        double dt_new   = (double)dt_int_s + dt_new_frac_sum / dev_count;
+        double diff_new = fabs(dt_current - dt_new);
+        diff_new_total += diff_new;
+        if (dt_new != 0.0 && diff_new < DT_DEV_THRESH)
+            dt_new_count++;
+        else
+            dt_new_count = 0;
+    } else {
+        dev_count      = 0;
+        dt_frac_sum   += dt_current - (double)dt_int_s;
+        count++;
+        dt_aowr        = (double)dt_int_s + dt_frac_sum / count;
+
+        dt0_frac_sum  += dt0_current - (double)dt_int_s;
+        dt0            = (double)dt_int_s + dt0_frac_sum / count;
+
+        if (dt_aowr_cp != 0.0) {
+            diff_total += fabs(dt0 + Ci - dt_aowr_cp);
+            cp_thresh   = 3.0 * diff_total / count;
+        }
+        dt_aowr_cp = dt0 + Ci;
+    }
+
+    if (dev_count >= DEV_COUNT_THRESH) {
+        if (dt_new_count >= DEV_COUNT_THRESH) {
+            dt_frac_sum    = dt_new_frac_sum;
+            count          = dt_new_count;
+            dt_aowr        = (double)dt_int_s + dt_new_frac_sum / dt_new_count;
+            dt_new_count   = 0;
+            diff_total     = diff_new_total;
+            diff_new_total = 0.0;
+            cp_thresh      = 3.0 / CLIGHT;
+        }
+        dev_count = 0;
+    }
+
+    double ep[6];
+    time2epoch(gtime, ep);
+    sdr_log(3, "$AOWR,%.3f,%.0f,%.0f,%.0f,%.0f,%.0f,%.3f,%d,%.3f,%.3f,"
+        "%.12f,%.12f,%.12f,%.12f,%.12f,%d,%d",
+        time, ep[0], ep[1], ep[2], ep[3], ep[4], ep[5],
+        sdr_ps_prn, P, L, dt_current, dt_aowr, dt_aowr_cp, dt0, cp_thresh,
+        count, outlier);
+}
+
 // update PVT solution ---------------------------------------------------------
 static void update_sol(sdr_pvt_t *pvt)
 {
@@ -1132,6 +1345,24 @@ static void update_sol(sdr_pvt_t *pvt)
             break;
         }
     }
+    // Resolve msec pseudorange ambiguities after merging L1+L2 into one entry.
+    // Must run here so L1CA reference (P[0]) is available in the same obsd_t when
+    // res_obs_amb searches for it. Running before merge zeroes L2CM pseudorange
+    // on epochs where the L2CM thread updates pvt->obs before the L1CA thread.
+    {
+        obs_t merged_obs;
+        merged_obs.data = obs;
+        merged_obs.n = nobs;
+        merged_obs.nmax = MAXSAT;
+        res_obs_amb(&merged_obs, SYS_GPS | SYS_QZS, CODE_L2S, 1e-3);
+        res_obs_amb(&merged_obs, SYS_GPS | SYS_QZS, CODE_L5Q, 20e-3);
+        res_obs_amb(&merged_obs, SYS_QZS, CODE_L5P, 20e-3);
+        res_obs_amb(&merged_obs, SYS_GLO, CODE_L3Q, 10e-3);
+        res_obs_amb(&merged_obs, SYS_SBS, CODE_L5Q, 2e-3);
+        out_log_obs(time, &merged_obs, pvt->nav);
+        out_rtcm3_obs(pvt->rtcm, &merged_obs, pvt->rcv->strs[1], pvt->rcv);
+        // update_aowr is now called at 20 ms rate from sdr_pvt_udobs()
+    }
     if (sdr_pmode >= PMODE_PPP_KINEMA) {
         // Set time interval for KF process noise propagation (rtkpos() normally does this)
         gtime_t obs_time = nobs > 0 ? obs[0].time : pvt->time;
@@ -1144,6 +1375,12 @@ static void update_sol(sdr_pvt_t *pvt)
         spopt.navsys |= SYS_GLO | SYS_GAL | SYS_QZS | SYS_CMP | SYS_IRN;
         spopt.elmin = sdr_el_mask * D2R;
         // Pass pvt->rtk->ssat so pntpos sets ssat[sat].vs=1; pppos needs vs=1 to accept obs
+        // In fixed-position mode, seed pntpos from the known position for a better clock estimate.
+        if (sdr_pmode == PMODE_PPP_FIXED && norm(sdr_fixpos, 3) > 1.0) {
+            pvt->rtk->sol.rr[0] = sdr_fixpos[0];
+            pvt->rtk->sol.rr[1] = sdr_fixpos[1];
+            pvt->rtk->sol.rr[2] = sdr_fixpos[2];
+        }
         pntpos(obs, nobs, pvt->nav, &spopt, &pvt->rtk->sol, NULL, pvt->rtk->ssat, msg);
 
         // Initialize clock states from pntpos when x[IC]=0.
@@ -1165,8 +1402,37 @@ static void update_sol(sdr_pvt_t *pvt)
             }
         }
 
+        // Carrier phase and Doppler are corrected for non-zero IF in update_obs()
+        // (both L1CA and L2CM independently, relative to zero-IF reference).
+        // GF/MW/Lc drift are all zero after correction. gf_drift stays 0.
+
         // PPP: dual-frequency Kalman filter via pppos()
         pppos(pvt->rtk, obs, nobs, pvt->nav);
+
+        // Prevent kinematic startup divergence.
+        // In IFLC mode, PPP needs 4 dual-freq (L1+L2) satellites. L2CM takes
+        // 30-60 s to lock on enough satellites. During that window, prnaccelh
+        // process noise accumulates in the velocity state (no measurements to
+        // correct it), causing the position to random-walk km away from truth.
+        // By the time 4 L2CM sats lock, residuals >> maxinno and the KF can
+        // never recover. Fix: zero vel/acc states each epoch while pos_std is
+        // large (>200 m, i.e., PPP not yet converged), keeping the position
+        // anchored to the SPP seed. Once PPP converges (pos_std falls below
+        // 200 m), the dynamics model takes over normally.
+        if (pvt->rtk->opt.dynamics) {
+            double *P = pvt->rtk->P;
+            int nx = pvt->rtk->nx;
+            double pos_std = nx > 0 ? sqrt(P[0] + P[1+nx] + P[2+2*nx]) : 0.0;
+            if (pos_std > 200.0) {
+                for (int j = 3; j < 9; j++) {
+                    pvt->rtk->x[j] = 0.0;
+                    for (int k = 0; k < nx; k++) {
+                        P[j + k*nx] = 0.0;
+                        P[k + j*nx] = 0.0;
+                    }
+                }
+            }
+        }
 
         // Diagnostics: log KF position state and dual-freq measurement count
         {
@@ -1292,19 +1558,8 @@ void sdr_pvt_udsol(sdr_pvt_t *pvt, int64_t ix)
     if (pvt->ix > 0 && (pvt->nch >= pvt->rcv->nch ||
         ix >= pvt->ix + (int)(sdr_lag_epoch / SDR_CYC))) {
         
-        // resolve msec ambiguity in pseudorange
-        res_obs_amb(pvt->obs, SYS_GPS | SYS_QZS, CODE_L2S, 1e-3);  // L2CM (1ms GPS code period)
-        res_obs_amb(pvt->obs, SYS_GPS | SYS_QZS, CODE_L5Q, 20e-3); // L5Q
-        res_obs_amb(pvt->obs, SYS_QZS, CODE_L5P, 20e-3); // L5SQ, L5SQV
-        res_obs_amb(pvt->obs, SYS_GLO, CODE_L3Q, 10e-3); // G3OCP
-        res_obs_amb(pvt->obs, SYS_SBS, CODE_L5Q, 2e-3);  // L5Q SBAS
-        
-        // sort obs data
+        // sort obs data (ordering for the merge step in update_sol)
         sortobs(pvt->obs);
-        
-        // output log $OBS and RTCM3 observation data
-        out_log_obs(pvt->ix * SDR_CYC, pvt->obs, pvt->nav);
-        out_rtcm3_obs(pvt->rtcm, pvt->obs, pvt->rcv->strs[1], pvt->rcv);
         if (pvt->obs->n > 0) pvt->count[1]++;
         
         // update PVT solution

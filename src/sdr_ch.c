@@ -63,6 +63,10 @@ double sdr_b_fll_n = B_FLL_N;
 double sdr_max_dop = MAX_DOP;
 double sdr_thres_cn0_l = THRES_CN0_L;
 double sdr_thres_cn0_u = THRES_CN0_U;
+double sdr_t_acq_L2        = -1;  // L2 signal acquisition integration time (-1: use sdr_t_acq)
+double sdr_t_dll_L2        = -1;  // L2 signal DLL integration time (-1: use sdr_t_dll)
+double sdr_thres_cn0_l_L2  = -1;  // L2 signal acquisition CN0 threshold (-1: use sdr_thres_cn0_l)
+double sdr_thres_cn0_u_L2  = -1;  // L2 signal loss-of-lock CN0 threshold (-1: use sdr_thres_cn0_u)
 int sdr_bump_jump = 0;
 double sdr_e5ab_off = 0.0;  // E5b-E5a group-delay (s)
 double sdr_bump_k = BUMP_K; // bump-jump threshold
@@ -318,6 +322,11 @@ sdr_ch_t *sdr_ch_new(const char *sig, int prn, double fs, double fi)
     ch->lock = ch->lost = 0;
     ch->costas = strcmp(ch->sig, "L6D") && strcmp(ch->sig, "L6E");
     ch->obs_idx = -1;
+    int is_L2 = !strncmp(ch->sig, "L2", 2);
+    ch->t_acq       = (is_L2 && sdr_t_acq_L2       >= 0) ? sdr_t_acq_L2       : sdr_t_acq;
+    ch->t_dll       = (is_L2 && sdr_t_dll_L2        >= 0) ? sdr_t_dll_L2       : sdr_t_dll;
+    ch->thres_cn0_l = (is_L2 && sdr_thres_cn0_l_L2  >= 0) ? sdr_thres_cn0_l_L2 : sdr_thres_cn0_l;
+    ch->thres_cn0_u = (is_L2 && sdr_thres_cn0_u_L2  >= 0) ? sdr_thres_cn0_u_L2 : sdr_thres_cn0_u;
     ch->acq = acq_new(ch->sig, ch->prn, ch->code, ch->len_code, ch->T, fs,
         ch->N);
     ch->trk = trk_new(ch->sig, ch->prn, ch->code, ch->len_code, ch->T, fs);
@@ -411,14 +420,14 @@ static void search_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff,
         ch->fi, fds, n, ch->acq->P_sum);
     ch->acq->n_sum++;
     
-    if (ch->acq->n_sum * ch->T >= sdr_t_acq) {
+    if (ch->acq->n_sum * ch->T >= ch->t_acq) {
         int idx[2];
-        
+
         // search max correlation power
         float cn0 = sdr_corr_max(ch->acq->P_sum, 2 * ch->N, ch->N, n, ch->T,
             idx);
-        
-        if (cn0 >= sdr_thres_cn0_l) {
+
+        if (cn0 >= ch->thres_cn0_l) {
             double fd = sdr_fine_dop(ch->acq->P_sum, 2 * ch->N, fds, n, idx);
             double coff = idx[1] / ch->fs;
             start_track(ch, time, fd, coff, cn0);
@@ -512,7 +521,7 @@ static void PLL(sdr_ch_t *ch)
 // DLL (2nd-order, zeta=0.707, Bn=W/0.53) --------------------------------------
 static void DLL(sdr_ch_t *ch)
 {
-    int N = MAX(1, (int)(sdr_t_dll / ch->T));
+    int N = MAX(1, (int)(ch->t_dll / ch->T));
     double sgn = ch->trk->C[0][0] >= 0.0 ? 1.0 : -1.0; // sign of IP (data wipe-off)
     for (int i = 0; i < ch->trk->npos + ch->trk->nposx; i++) {
         ch->trk->sumC[i] += SQR(ch->trk->C[i][0]) + SQR(ch->trk->C[i][1]);
@@ -724,7 +733,7 @@ static void track_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff, int ix)
         sdr_nav_decode(ch);
     }
     // test signal lost 
-    double t_cn0 = !strncmp(ch->sig, "L6", 2) ? THRES_CN0_L6 : sdr_thres_cn0_u;
+    double t_cn0 = !strncmp(ch->sig, "L6", 2) ? THRES_CN0_L6 : ch->thres_cn0_u;
     if (ch->cn0 < t_cn0) {
         ch->state = SDR_STATE_IDLE;
         ch->lock = 0;

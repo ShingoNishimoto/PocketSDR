@@ -223,9 +223,13 @@ typedef struct {                // SDR receiver channel type
     double cn0;                 // C/N0 (dB-Hz) 
     int week, tow;              // week number (week), TOW (ms)
     int tow_v;                  // TOW flag (0:invalid,1:valid,2:amb-unresolved)
-    int lock, lost;             // lock and lost counts 
-    int costas;                 // Costas PLL flag 
+    int lock, lost;             // lock and lost counts
+    int costas;                 // Costas PLL flag
     int obs_idx;                // observation data index
+    double t_acq;               // acquisition integration time (s)
+    double t_dll;               // DLL integration time (s)
+    double thres_cn0_l;         // acquisition CN0 threshold (dB-Hz)
+    double thres_cn0_u;         // loss-of-lock CN0 threshold (dB-Hz)
     sdr_acq_t *acq;             // signal acquisition 
     sdr_trk_t *trk;             // signal tracking 
     sdr_nav_t *nav;             // navigation decoder
@@ -490,6 +494,7 @@ int sdr_decode_NB_LDPC(const uint8_t H_idx[][4], const uint8_t H_ele[][4],
 // sdr_pvt.c
 sdr_pvt_t *sdr_pvt_new(sdr_rcv_t *rcv);
 void sdr_pvt_free(sdr_pvt_t *pvt);
+void sdr_pvt_loadnav(sdr_pvt_t *pvt, const char *file);
 void sdr_pvt_udobs(sdr_pvt_t *pvt, int64_t ix, sdr_ch_t *ch);
 void sdr_pvt_udnav(sdr_pvt_t *pvt, sdr_ch_t *ch);
 void sdr_pvt_udsol(sdr_pvt_t *pvt, int64_t ix);

@@ -2511,7 +2511,7 @@ void sdr_sat_id(const char *sig, int prn, char *sat)
     if (Sig[0] == 'L') {
         if (prn >= 1 && prn <= 63) { // GPS
             sprintf(sat, "G%02d", prn);
-        } else if (prn >= 120 && prn <= 158) { // SBAS
+        } else if (prn >= 120 && prn <= 160) { // SBAS (159-160: pseudo-sat)
             sprintf(sat, "S%02d", prn - 100);
         } else { // QZSS
             sat_id_qzss(Sig, prn ,sat);

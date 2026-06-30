@@ -35,8 +35,8 @@ cp $conffile $date_str
 # run
 pocket_trk \
     -c $conffile \
-    -sig L1CA,L2CM -prn 1-32,193-202 -rfch 3,4 -f 4 -IQ 2 -ppps \
-    -opt $confpath/ppp_l2_opt.ini \
+    -sig L1CA,L2CM -prn 1-32,193-202 -rfch 3,4 -f 4 -IQ 2 -ppp \
+    -opt $confpath/ppp_kinematic_drone.ini \
     $(build_nav_args) \
     -log $date_str/pocket.log -nmea /dev/ttyUSB0 \
     -debug $date_str/trace.log

@@ -439,9 +439,9 @@ static void detslp_gf(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
         
         trace(4,"detslip_gf: sat=%2d gf0=%8.3f gf1=%8.3f\n",obs[i].sat,g0,g1);
         
-        if (g0!=0.0&&fabs(g1-g0)>rtk->opt.thresslip) {
-            trace(3,"detslip_gf: slip detected sat=%2d gf=%8.3f->%8.3f\n",
-                  obs[i].sat,g0,g1);
+        if (g0!=0.0&&fabs(g1-g0-rtk->opt.gf_drift)>rtk->opt.thresslip) {
+            trace(3,"detslip_gf: slip detected sat=%2d gf=%8.3f->%8.3f drift=%8.4f\n",
+                  obs[i].sat,g0,g1,rtk->opt.gf_drift);
             
             for (j=0;j<rtk->opt.nf;j++) rtk->ssat[obs[i].sat-1].slip[j]|=1;
         }
@@ -862,7 +862,7 @@ static int model_iono(gtime_t time, const double *pos, const double *azel,
         *var=0.0;
         return 1;
     }
-    if (opt->ionoopt==IONOOPT_IFLC) {
+    if (opt->ionoopt==IONOOPT_IFLC||opt->ionoopt==IONOOPT_GRAPHIC) {
         *dion=*var=0.0;
         return 1;
     }

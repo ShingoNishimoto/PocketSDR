@@ -51,6 +51,9 @@ static const char *usage_text[] = {
     "       [-toff toff] [-ti tint] [-p bus,[,port] [-c conf_file]",
     "       [-driver name] [-gain gain] [-bw bw] [-fd dopp]",
     "       [-ppp] [-ppps] [-pppg] [-pppsg]",
+    "       [-ps_prn prn] (pseudo-satellite PRN for AOWR time-transfer)",
+    "       [-fixpos lat,lon,hgt] (fix receiver position for clock-only PPP estimation)",
+    "       [-nav sp3_or_clk_file] (repeatable; SP3 orbit and/or CLK file for PPP)",
     "       [-log path] [-nmea path] [-rtcm path] [-raw path] [-opt file] [file]",
     NULL
 };
@@ -176,6 +179,7 @@ int main(int argc, char **argv)
     const char *debug_file = "";
     const char *driver = "";
     double gain = 0.0, bw = 0.0, max_dop = 0.0;
+    const char *nav_files[32]; int n_nav = 0; // SP3/CLK files for precise ephemeris
     char rfch_opt[1024] = "-RFCH";
     sig_list[0] = sig;
 
@@ -268,6 +272,19 @@ int main(int argc, char **argv)
         } else if (!strcmp(argv[i], "-pppsg")) {
             sdr_rcv_setopt("pmode", PMODE_PPP_STATIC);
             sdr_rcv_setopt("ionoopt", IONOOPT_GRAPHIC);
+        } else if (!strcmp(argv[i], "-fixpos") && i + 1 < argc) {
+            double llh[3] = {0}, ecef[3];
+            sscanf(argv[++i], "%lf,%lf,%lf", llh, llh + 1, llh + 2);
+            llh[0] *= D2R; llh[1] *= D2R;
+            pos2ecef(llh, ecef);
+            sdr_rcv_setopt("fixpos_x", ecef[0]);
+            sdr_rcv_setopt("fixpos_y", ecef[1]);
+            sdr_rcv_setopt("fixpos_z", ecef[2]);
+            sdr_rcv_setopt("pmode", PMODE_PPP_FIXED);
+        } else if (!strcmp(argv[i], "-nav") && i + 1 < argc) {
+            if (n_nav < 32) nav_files[n_nav++] = argv[++i]; else ++i;
+        } else if (!strcmp(argv[i], "-ps_prn") && i + 1 < argc) {
+            sdr_rcv_setopt("ps_prn", atof(argv[++i]));
         } else if (!strcmp(argv[i], "-opt") && i + 1 < argc) {
             opt_file = argv[++i];
         } else if (!strcmp(argv[i], "-debug") && i + 1 < argc) {
@@ -333,6 +350,10 @@ int main(int argc, char **argv)
     }
     if (!rcv) {
         return -1;
+    }
+    // load precise ephemeris files (SP3 orbit + RINEX CLK) if provided
+    for (int i = 0; i < n_nav; i++) {
+        sdr_pvt_loadnav(rcv->pvt, nav_files[i]);
     }
     if (tint > 0.0) {
         printf("%s", ESC_HCUR);

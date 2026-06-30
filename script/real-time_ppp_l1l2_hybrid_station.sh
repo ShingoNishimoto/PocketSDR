@@ -35,7 +35,7 @@ cp $conffile $date_str
 # run
 pocket_trk \
     -c $conffile \
-    -sig L1CA,L2CM -prn 1-32,193-202 -rfch 3,4 -f 4 -IQ 2 -ppps \
+    -sig L1CA,L2CM -prn 1-32,160,193-202 -ps_prn 160 -rfch 3,4 -f 4 -IQ 2 -ppps \
     -opt $confpath/ppp_l2_opt.ini \
     $(build_nav_args) \
     -log $date_str/pocket.log -nmea /dev/ttyUSB0 \
@@ -48,4 +48,10 @@ cd $date_str
 python3 ../../python/pocket_pos_plot.py pocket.log --out pos_result.pdf
 python3 ../../python/pocket_export.py pocket.log --all
 python3 ../../python/pocket_obs2rnx.py pocket.log
+
+# extract AOWR time-transfer results
+grep '^\$AOWR' pocket.log | \
+    awk -F',' 'BEGIN{print "time,year,month,day,hour,min,sec,prn,P,L,dt_raw,dt_pr,dt_cp,dt0,cp_thresh,count,outlier"} \
+    {print $2","$3","$4","$5","$6","$7","$8","$9","$10","$11","$12","$13","$14","$15","$16","$17","$18}' \
+    > aowr.csv
 popd

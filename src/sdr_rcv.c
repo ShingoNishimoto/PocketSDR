@@ -1227,12 +1227,42 @@ static void update_srch_ch(sdr_rcv_t *rcv)
     if (rcv->ich >= 0 && rcv->th[rcv->ich]->ch->state == SDR_STATE_SRCH) {
         return;
     }
+    extern int sdr_ps_prn;
+    static int ps_ever_locked = 0; // one-way latch: set on first PRN lock
+    static int ps_turn = 0;        // alternates: PS gets every other search slot
+
+    // detect first lock of PS channel (one-way latch, never resets)
+    if (!ps_ever_locked && sdr_ps_prn > 0) {
+        for (int i = 0; i < rcv->nch; i++) {
+            sdr_ch_t *ch = rcv->th[i]->ch;
+            if (ch->prn == sdr_ps_prn && !strcmp(ch->sig, "L1CA") &&
+                ch->state == SDR_STATE_LOCK) {
+                ps_ever_locked = 1;
+                break;
+            }
+        }
+    }
+    // before first PS lock: give PS a slot every other search
+    if (sdr_ps_prn > 0 && !ps_ever_locked && (ps_turn ^= 1)) {
+        for (int i = 0; i < rcv->nch; i++) {
+            sdr_ch_t *pch = rcv->th[i]->ch;
+            if (pch->prn == sdr_ps_prn && !strcmp(pch->sig, "L1CA") &&
+                pch->state == SDR_STATE_IDLE &&
+                (re_acq(rcv, pch) || assist_acq(rcv, pch) ||
+                 (pch->T <= sdr_max_acq * 1e-3 && pch->sig_srch))) {
+                pch->state = SDR_STATE_SRCH;
+                rcv->ich = i;
+                return;
+            }
+        }
+        // PS not eligible this turn (not yet transmitting): fall through
+    }
     for (int i = 0; i < rcv->nch; i++) {
         // search next IDLE channel
         rcv->ich = (rcv->ich + 1) % rcv->nch;
         sdr_ch_t *ch = rcv->th[rcv->ich]->ch;
         if (ch->state != SDR_STATE_IDLE) continue;
-        
+
         // fast acquisition: skip invisible satellites, aid visible ones
         if (rcv->fast_acq) {
             int w = fast_acq(rcv, ch);
@@ -1878,7 +1908,12 @@ void sdr_rcv_setopt(const char *opt, double value)
     extern double sdr_epoch, sdr_lag_epoch, sdr_el_mask, sdr_sp_corr, sdr_t_acq;
     extern double sdr_t_dll, sdr_b_dll, sdr_b_pll, sdr_b_fll_w, sdr_b_fll_n;
     extern double sdr_max_dop, sdr_thres_cn0_l, sdr_thres_cn0_u;
-    extern int sdr_bump_jump, sdr_ionoopt, sdr_pmode;
+    extern double sdr_t_acq_L2, sdr_t_dll_L2, sdr_thres_cn0_l_L2, sdr_thres_cn0_u_L2;
+    extern double sdr_fixpos[3];
+    extern int sdr_bump_jump, sdr_ionoopt, sdr_pmode, sdr_dynamics;
+    extern double sdr_prnaccelh, sdr_prnaccv;
+    extern int sdr_ps_prn;
+    extern double sdr_ps_dist, sdr_ps_freq_err;
     if      (!strcmp(opt, "epoch"      )) sdr_epoch       = value;
     else if (!strcmp(opt, "lag_epoch"  )) sdr_lag_epoch   = value;
     else if (!strcmp(opt, "el_mask"    )) sdr_el_mask     = value;
@@ -1890,11 +1925,24 @@ void sdr_rcv_setopt(const char *opt, double value)
     else if (!strcmp(opt, "b_fll_w"    )) sdr_b_fll_w     = value;
     else if (!strcmp(opt, "b_fll_n"    )) sdr_b_fll_n     = value;
     else if (!strcmp(opt, "max_dop"    )) sdr_max_dop     = value;
-    else if (!strcmp(opt, "thres_cn0_l")) sdr_thres_cn0_l = value;
-    else if (!strcmp(opt, "thres_cn0_u")) sdr_thres_cn0_u = value;
-    else if (!strcmp(opt, "bump_jump"  )) sdr_bump_jump   = (int)value;
+    else if (!strcmp(opt, "thres_cn0_l"   )) sdr_thres_cn0_l    = value;
+    else if (!strcmp(opt, "thres_cn0_u"   )) sdr_thres_cn0_u    = value;
+    else if (!strcmp(opt, "t_acq_L2"      )) sdr_t_acq_L2       = value;
+    else if (!strcmp(opt, "t_dll_L2"      )) sdr_t_dll_L2       = value;
+    else if (!strcmp(opt, "thres_cn0_l_L2")) sdr_thres_cn0_l_L2 = value;
+    else if (!strcmp(opt, "thres_cn0_u_L2")) sdr_thres_cn0_u_L2 = value;
+    else if (!strcmp(opt, "bump_jump"     )) sdr_bump_jump       = (int)value;
     else if (!strcmp(opt, "max_acq"    )) sdr_max_acq     = value;
     else if (!strcmp(opt, "ionoopt"    )) sdr_ionoopt     = (int)value;
     else if (!strcmp(opt, "pmode"      )) sdr_pmode       = (int)value;
+    else if (!strcmp(opt, "fixpos_x"   )) sdr_fixpos[0]   = value;
+    else if (!strcmp(opt, "fixpos_y"   )) sdr_fixpos[1]   = value;
+    else if (!strcmp(opt, "fixpos_z"   )) sdr_fixpos[2]   = value;
+    else if (!strcmp(opt, "dynamics"   )) sdr_dynamics    = (int)value;
+    else if (!strcmp(opt, "prnaccelh"  )) sdr_prnaccelh   = value;
+    else if (!strcmp(opt, "prnaccv"    )) sdr_prnaccv     = value;
+    else if (!strcmp(opt, "ps_prn"      )) sdr_ps_prn       = (int)value;
+    else if (!strcmp(opt, "ps_dist"     )) sdr_ps_dist      = value;
+    else if (!strcmp(opt, "ps_freq_err" )) sdr_ps_freq_err  = value;
     else fprintf(stderr, "sdr_rcv_setopt error opt=%s\n", opt);
 }
