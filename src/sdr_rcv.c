@@ -1223,40 +1223,46 @@ static void update_srch_ch(sdr_rcv_t *rcv)
     if (rcv->stats.buff_use > MAX_BUFF_USE) { // IF data buffer full ?
         return;
     }
-    // signal search channel busy ?
-    if (rcv->ich >= 0 && rcv->th[rcv->ich]->ch->state == SDR_STATE_SRCH) {
-        return;
-    }
     extern int sdr_ps_prn;
-    static int ps_ever_locked = 0; // one-way latch: set on first PRN lock
+    static int ps_ever_locked = 0; // one-way latch: set on first PS lock
     static int ps_turn = 0;        // alternates: PS gets every other search slot
+    static int ps_idx = -1;        // channel index of PS L1CA (found once)
 
-    // detect first lock of PS channel (one-way latch, never resets)
-    if (!ps_ever_locked && sdr_ps_prn > 0) {
+    // find PS channel index once
+    if (ps_idx < 0 && sdr_ps_prn > 0) {
         for (int i = 0; i < rcv->nch; i++) {
             sdr_ch_t *ch = rcv->th[i]->ch;
-            if (ch->prn == sdr_ps_prn && !strcmp(ch->sig, "L1CA") &&
-                ch->state == SDR_STATE_LOCK) {
-                ps_ever_locked = 1;
-                break;
+            if (ch->prn == sdr_ps_prn && !strcmp(ch->sig, "L1CA")) {
+                ps_idx = i; break;
             }
+        }
+    }
+    // signal search channel busy? (normal channel OR PS channel)
+    if ((rcv->ich >= 0 && rcv->th[rcv->ich]->ch->state == SDR_STATE_SRCH) ||
+        (ps_idx >= 0 && rcv->th[ps_idx]->ch->state == SDR_STATE_SRCH)) {
+        return;
+    }
+    // detect first lock of PS channel (one-way latch, never resets)
+    if (!ps_ever_locked && ps_idx >= 0) {
+        if (rcv->th[ps_idx]->ch->state == SDR_STATE_LOCK) {
+            ps_ever_locked = 1;
         }
     }
     // before first PS lock: give PS a slot every other search
-    if (sdr_ps_prn > 0 && !ps_ever_locked && (ps_turn ^= 1)) {
-        for (int i = 0; i < rcv->nch; i++) {
-            sdr_ch_t *pch = rcv->th[i]->ch;
-            if (pch->prn == sdr_ps_prn && !strcmp(pch->sig, "L1CA") &&
-                pch->state == SDR_STATE_IDLE &&
-                (re_acq(rcv, pch) || assist_acq(rcv, pch) ||
-                 (pch->T <= sdr_max_acq * 1e-3 && pch->sig_srch))) {
-                pch->state = SDR_STATE_SRCH;
-                rcv->ich = i;
-                return;
-            }
+    // IMPORTANT: do NOT change rcv->ich here — it tracks the normal round-robin
+    // position. Changing it to ps_idx would cause non-PS turns to always restart
+    // from ps_idx+1, permanently starving all channels before ps_idx.
+    if (ps_idx >= 0 && !ps_ever_locked && (ps_turn ^= 1)) {
+        sdr_ch_t *pch = rcv->th[ps_idx]->ch;
+        if (pch->state == SDR_STATE_IDLE &&
+            (re_acq(rcv, pch) || assist_acq(rcv, pch) ||
+             (pch->T <= sdr_max_acq * 1e-3 && pch->sig_srch))) {
+            pch->state = SDR_STATE_SRCH;
+            return; // rcv->ich unchanged: round-robin resumes from here next time
         }
-        // PS not eligible this turn (not yet transmitting): fall through
+        // PS not eligible this turn: fall through to normal round-robin
     }
+    int launched = 0;
     for (int i = 0; i < rcv->nch; i++) {
         // search next IDLE channel
         rcv->ich = (rcv->ich + 1) % rcv->nch;
@@ -1273,16 +1279,27 @@ static void update_srch_ch(sdr_rcv_t *rcv)
                 if (nw < 3) nw = 3;
                 ch->acq->fd_ext_n = nw;
                 ch->state = SDR_STATE_SRCH;
+                launched = 1;
                 break;
             }
         }
+        // Skip L2/L5 long-code channels in cold-start until same-satellite L1
+        // is locked.  L2CM takes ~100ms per search; 43 channels × 100ms = 4.3s
+        // of L2CM in each round-robin pass, starving L1CA cold-start acquisition.
+        // Once L1CA is locked, assist_acq() returns true and L2CM is searched
+        // immediately with Doppler assistance.
+        int r_acq = re_acq(rcv, ch), a_acq = assist_acq(rcv, ch);
+        if (ch->T > 5e-3 && !r_acq && !a_acq) {
+            continue; // defer L2/L5 until L1 counterpart is locked
+        }
         // re-acquisition, assisted-acquisition or short code cycle
-        if (re_acq(rcv, ch) || assist_acq(rcv, ch) ||
-            (ch->T <= sdr_max_acq * 1e-3 && ch->sig_srch)) {
+        if (r_acq || a_acq || (ch->T <= sdr_max_acq * 1e-3 && ch->sig_srch)) {
             ch->state = SDR_STATE_SRCH;
+            launched = 1;
             break;
         }
     }
+    (void)launched;
 }
 
 // SDR receiver thread ---------------------------------------------------------
@@ -1914,6 +1931,7 @@ void sdr_rcv_setopt(const char *opt, double value)
     extern double sdr_prnaccelh, sdr_prnaccv;
     extern int sdr_ps_prn;
     extern double sdr_ps_dist, sdr_ps_freq_err;
+    extern int sdr_ps_gs_mode;
     if      (!strcmp(opt, "epoch"      )) sdr_epoch       = value;
     else if (!strcmp(opt, "lag_epoch"  )) sdr_lag_epoch   = value;
     else if (!strcmp(opt, "el_mask"    )) sdr_el_mask     = value;
@@ -1944,5 +1962,6 @@ void sdr_rcv_setopt(const char *opt, double value)
     else if (!strcmp(opt, "ps_prn"      )) sdr_ps_prn       = (int)value;
     else if (!strcmp(opt, "ps_dist"     )) sdr_ps_dist      = value;
     else if (!strcmp(opt, "ps_freq_err" )) sdr_ps_freq_err  = value;
+    else if (!strcmp(opt, "ps_gs_mode"  )) sdr_ps_gs_mode   = (int)value;
     else fprintf(stderr, "sdr_rcv_setopt error opt=%s\n", opt);
 }

@@ -247,10 +247,11 @@ static void hex_str(const uint8_t *data, int nbits, char *str, int size)
 // update tow ------------------------------------------------------------------
 static void update_tow(sdr_ch_t *ch, double tow)
 {
+    int tow_ms = (int)(tow / 1e-3);
     if (ch->tow <= 0) {
-        ch->tow = (int)(tow / 1e-3);
-    } else if (ch->tow == (int)(tow / 1e-3)) {
-        ch->tow_v = 1; // tow valid
+        ch->tow = tow_ms;
+    } else if (abs(ch->tow - tow_ms) <= 1) {
+        ch->tow_v = 1; // tow valid (allow ±1ms for tracking loop drift)
     } else { // TOW mismatch
         trace(2, "tow mismatch: sat=%s sig=%s tow=%.3f -> %.3f\n", ch->sat,
             ch->sig, ch->tow * 1e-3, tow);

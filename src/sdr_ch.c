@@ -651,12 +651,18 @@ static void adj_coff(sdr_ch_t *ch)
         ch->coff -= ch->T;
         update_tow(ch, -ch->T);
         ch->lock--;
+        if (ch->nav->ssync  > 0) ch->nav->ssync--;
+        if (ch->nav->fsync  > 0) ch->nav->fsync--;
+        if (ch->trk->sec_sync > 0) ch->trk->sec_sync--;
         memmove(ch->trk->P + 1, ch->trk->P, sizeof(sdr_cpx_t) *
             (SDR_N_HIST - 1));
     } else if (ch->coff < 0.0) {
         ch->coff += ch->T;
         update_tow(ch, ch->T);
         ch->lock++;
+        if (ch->nav->ssync  > 0) ch->nav->ssync++;
+        if (ch->nav->fsync  > 0) ch->nav->fsync++;
+        if (ch->trk->sec_sync > 0) ch->trk->sec_sync++;
         memmove(ch->trk->P, ch->trk->P + 1, sizeof(sdr_cpx_t) *
             (SDR_N_HIST - 1));
     }

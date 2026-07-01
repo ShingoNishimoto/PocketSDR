@@ -14,6 +14,12 @@
 //                   add nav data consistency tests
 //
 #include "pocket_sdr.h"
+#ifndef WIN32
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#endif
 
 // constants and macros --------------------------------------------------------
 #define SDR_EPOCH      1.0      // epoch time interval (s)
@@ -39,6 +45,32 @@ double sdr_fixpos[3] = {0.0};  // known ECEF position for fixed-position mode (m
 int    sdr_ps_prn      = 0;     // pseudo-satellite PRN for AOWR time-transfer (0: disabled)
 double sdr_ps_dist     = 0.6;   // true distance to pseudo-sat transmitter (m)
 double sdr_ps_freq_err = 0.0;   // PS transmitter LO frequency error (Hz), e.g. -7.15e-3 for bladeRF
+int    sdr_ps_gs_mode  = 0;     // GS mode: write clock_diff for SC (0: disabled)
+char   sdr_ps_gs_file[256] = "./clock_diff.txt"; // output file for GS→SC IPC
+
+// GS text ring-buffer — matches write_clock_difference() in gnss-sdr and
+// getClockDiff() in jaxa-asyncOWR-prototype/src/bladeGPS/gpssim.c
+// Format: 30 lines × 36 bytes, each line "tow(16),clock_diff_s(18)\n"
+#define GS_LINE_SIZE  36
+#define GS_NUM_LINES  30
+#define GS_FILE_SIZE  (GS_LINE_SIZE * GS_NUM_LINES)   // 1080 bytes
+
+// SC shared-data struct (binary) — matches hybrid_shared_data in gnss-sdr rtklib_pvt_gs
+// Reserved for future SC-side implementation; not written in GS mode.
+typedef struct {
+    uint64_t seq;           // incremented each write; SC checks before/after for consistency
+    double   tag_tow;       // estimated GPS TOW of PS transmission (s)
+    double   clock_diff_s;  // PS clock offset from GPS = -dt_aowr_cp + rx_clock_offset (s)
+    double   range_m;       // GS-to-PS distance (m), = sdr_ps_dist
+} aowr_gs_shared_t;
+
+static int   s_gs_fd       = -1;
+static char *s_gs_map      = NULL;
+static int   s_gs_cur_line = 0;
+static double           s_rx_clock_s       = 0.0; // last receiver clock offset (s), from PVT epoch
+static int              s_rx_sol_valid     = 0;   // 1 when PVT solution is valid
+static double           s_gs_last_dt_aowr  = 0.0; // last valid dt_aowr_cp (s), frozen after PS loss
+static int              s_gs_ps_ever_obs   = 0;   // 1 once PS has been observed (never reset)
 int    sdr_dynamics  = 0;      // enable dynamics model for kinematic PPP
 double sdr_prnaccelh = -1.0;   // horizontal acceleration process noise (m/s²), <0 = use RTKLIB default
 double sdr_prnaccv   = -1.0;   // vertical acceleration process noise (m/s²), <0 = use RTKLIB default
@@ -684,6 +716,60 @@ static void load_navdata(const char *file, nav_t *nav, sdr_pvt_t *pvt)
     fclose(fp);
 }
 
+// GS mode: open shared-data file and mmap it ---------------------------------
+static void open_aowr_gs(void)
+{
+#ifndef WIN32
+    s_gs_fd = open(sdr_ps_gs_file, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (s_gs_fd < 0) {
+        sdr_log(1, "$LOG,0,,0,GS: cannot open %s: %s", sdr_ps_gs_file, strerror(errno));
+        return;
+    }
+    // Extend file to GS_FILE_SIZE (matching gnss-sdr write_clock_difference init)
+    if (lseek(s_gs_fd, GS_FILE_SIZE - 1, SEEK_SET) == -1 ||
+        write(s_gs_fd, "", 1) == -1) {
+        sdr_log(1, "$LOG,0,,0,GS: write error on %s", sdr_ps_gs_file);
+        close(s_gs_fd); s_gs_fd = -1; return;
+    }
+    s_gs_map = (char *)mmap(NULL, GS_FILE_SIZE,
+        PROT_READ | PROT_WRITE, MAP_SHARED, s_gs_fd, 0);
+    if (s_gs_map == MAP_FAILED) {
+        sdr_log(1, "$LOG,0,,0,GS: mmap failed on %s", sdr_ps_gs_file);
+        s_gs_map = NULL; close(s_gs_fd); s_gs_fd = -1; return;
+    }
+    memset(s_gs_map, ' ', GS_FILE_SIZE);
+    s_gs_cur_line = 0;
+    sdr_log(3, "$LOG,0,,0,GS mode: sharing %s", sdr_ps_gs_file);
+#endif
+}
+
+static void close_aowr_gs(void)
+{
+#ifndef WIN32
+    if (s_gs_map) { munmap(s_gs_map, GS_FILE_SIZE); s_gs_map = NULL; }
+    if (s_gs_fd >= 0) { close(s_gs_fd); s_gs_fd = -1; }
+#endif
+}
+
+static void write_aowr_gs(double tag_tow, double clock_diff_s)
+{
+#ifndef WIN32
+    if (!s_gs_map) return;
+    // Text ring-buffer matching write_clock_difference() in gnss-sdr and
+    // read by getClockDiff() in jaxa-asyncOWR-prototype:
+    //   16-char tow + "," + 18-char clock_diff_s + "\n" = 36 bytes/line
+    char tow_buf[32], dt_buf[32];
+    snprintf(tow_buf, sizeof(tow_buf), "%16.15g", tag_tow);
+    snprintf(dt_buf,  sizeof(dt_buf),  "%18.16g", clock_diff_s);
+    tow_buf[16] = '\0';  // truncate to exactly 16 chars
+    dt_buf[18]  = '\0';  // truncate to exactly 18 chars
+    char line[GS_LINE_SIZE + 1];
+    snprintf(line, sizeof(line), "%.16s,%.18s\n", tow_buf, dt_buf);
+    memcpy(s_gs_map + (size_t)s_gs_cur_line * GS_LINE_SIZE, line, GS_LINE_SIZE);
+    s_gs_cur_line = (s_gs_cur_line + 1) % GS_NUM_LINES;
+#endif
+}
+
 //------------------------------------------------------------------------------
 //  Generate a new SDR PVT.
 //
@@ -738,6 +824,7 @@ sdr_pvt_t *sdr_pvt_new(sdr_rcv_t *rcv)
     pvt->rcv = rcv;
     sdr_mutex_init(&pvt->mtx);
     load_navdata(FILE_NAV, pvt->nav, pvt); // load nav + almanac + last fix
+    if (sdr_ps_gs_mode) open_aowr_gs();
     return pvt;
 }
 
@@ -803,6 +890,7 @@ void sdr_pvt_loadnav(sdr_pvt_t *pvt, const char *file)
 void sdr_pvt_free(sdr_pvt_t *pvt)
 {
     if (!pvt) return;
+    close_aowr_gs();
     save_navdata(FILE_NAV, pvt->nav, pvt); // save nav + almanac + last fix
     sdr_free(pvt->obs->data);
     sdr_free(pvt->obs);
@@ -1302,10 +1390,15 @@ static void update_aowr(double time, gtime_t gtime, double P, double L)
         dev_count = 0;
     }
 
+    if (sdr_ps_gs_mode && count > 0) {
+        s_gs_last_dt_aowr = dt_aowr_cp;
+        s_gs_ps_ever_obs  = 1;
+    }
+
     double ep[6];
     time2epoch(gtime, ep);
     sdr_log(3, "$AOWR,%.3f,%.0f,%.0f,%.0f,%.0f,%.0f,%.3f,%d,%.3f,%.3f,"
-        "%.12f,%.12f,%.12f,%.12f,%.12f,%d,%d",
+        "%.17g,%.17g,%.17g,%.17g,%.17g,%d,%d",
         time, ep[0], ep[1], ep[2], ep[3], ep[4], ep[5],
         sdr_ps_prn, P, L, dt_current, dt_aowr, dt_aowr_cp, dt0, cp_thresh,
         count, outlier);
@@ -1381,7 +1474,9 @@ static void update_sol(sdr_pvt_t *pvt)
             pvt->rtk->sol.rr[1] = sdr_fixpos[1];
             pvt->rtk->sol.rr[2] = sdr_fixpos[2];
         }
+        sol_t spp_sol = {0};  // save SPP result in case PPP fails (L1-only, no L2 yet)
         pntpos(obs, nobs, pvt->nav, &spopt, &pvt->rtk->sol, NULL, pvt->rtk->ssat, msg);
+        if (pvt->rtk->sol.stat) spp_sol = pvt->rtk->sol;
 
         // Initialize clock states from pntpos when x[IC]=0.
         // udclk_ppp() initializes clocks only when norm(x[0:3])=0, but udpos_ppp()
@@ -1468,6 +1563,12 @@ static void update_sol(sdr_pvt_t *pvt)
 
         if (pvt->sol->stat) {
             output_sol(pvt, time);
+        } else if (spp_sol.stat) {
+            // PPP has no solution yet (L2 not available or not converged).
+            // Fall back to SPP so position output starts as soon as L1-only
+            // observations are ready, rather than staying silent until L2 locks.
+            *pvt->sol = spp_sol;
+            output_sol(pvt, time);
         } else {
             update_azel(pvt->nav, pvt->sol, pvt->ssat);
             pvt->sol->ns = 0;
@@ -1509,6 +1610,16 @@ static void update_sol(sdr_pvt_t *pvt)
         trace(3, "%s %d %4.1f %5.1f %4.1f %12.3f\n", sat, ssat->vs,
             ssat->snr[0] * SNR_UNIT, ssat->azel[0] * R2D, ssat->azel[1] * R2D,
             ssat->resp[0]);
+    }
+    s_rx_clock_s  = (pvt->sol->stat == SOLQ_PPP) ?
+        pvt->sol->dtr[0] / CLIGHT : pvt->sol->dtr[0];
+    s_rx_sol_valid = (pvt->sol->stat > 0);
+    // Write GS ring-buffer at every PVT epoch once PS has been observed,
+    // matching gnss-sdr write_clock_difference() which persists after PS loss.
+    if (sdr_ps_gs_mode && s_rx_sol_valid && s_gs_ps_ever_obs) {
+        int week;
+        double tow = time2gpst(pvt->sol->time, &week);
+        write_aowr_gs(tow - s_gs_last_dt_aowr, -s_gs_last_dt_aowr + s_rx_clock_s);
     }
 }
 

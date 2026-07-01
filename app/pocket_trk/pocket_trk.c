@@ -52,6 +52,7 @@ static const char *usage_text[] = {
     "       [-driver name] [-gain gain] [-bw bw] [-fd dopp]",
     "       [-ppp] [-ppps] [-pppg] [-pppsg]",
     "       [-ps_prn prn] (pseudo-satellite PRN for AOWR time-transfer)",
+    "       [-ps_gs] [-ps_gs_file path] (GS mode: write AOWR clock_diff binary for SC)",
     "       [-fixpos lat,lon,hgt] (fix receiver position for clock-only PPP estimation)",
     "       [-nav sp3_or_clk_file] (repeatable; SP3 orbit and/or CLK file for PPP)",
     "       [-log path] [-nmea path] [-rtcm path] [-raw path] [-opt file] [file]",
@@ -285,6 +286,11 @@ int main(int argc, char **argv)
             if (n_nav < 32) nav_files[n_nav++] = argv[++i]; else ++i;
         } else if (!strcmp(argv[i], "-ps_prn") && i + 1 < argc) {
             sdr_rcv_setopt("ps_prn", atof(argv[++i]));
+        } else if (!strcmp(argv[i], "-ps_gs")) {
+            sdr_rcv_setopt("ps_gs_mode", 1);
+        } else if (!strcmp(argv[i], "-ps_gs_file") && i + 1 < argc) {
+            extern char sdr_ps_gs_file[];
+            snprintf(sdr_ps_gs_file, 256, "%s", argv[++i]);
         } else if (!strcmp(argv[i], "-opt") && i + 1 < argc) {
             opt_file = argv[++i];
         } else if (!strcmp(argv[i], "-debug") && i + 1 < argc) {

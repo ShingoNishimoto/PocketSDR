@@ -35,7 +35,7 @@ cp $conffile $date_str
 # run
 pocket_trk \
     -c $conffile \
-    -sig L1CA,L2CM -prn 1-32,160,193-202 -ps_prn 160 -rfch 3,4 -f 4 -IQ 2 -ppps \
+    -sig L1CA,L2CM -prn 1-32,160,193-202 -ps_prn 160 -rfch 3,4 -f 4 -IQ 2 -ppps -ps_gs \
     -opt $confpath/ppp_l2_opt.ini \
     $(build_nav_args) \
     -log $date_str/pocket.log -nmea /dev/ttyUSB0 \
