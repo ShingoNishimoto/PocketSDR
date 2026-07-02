@@ -3565,29 +3565,39 @@ extern double satazel(const double *pos, const double *e, double *azel)
     if (pos[2]>-RE_WGS84) {
         ecef2enu(pos,e,enu);
         if (sdr_sc_ant_fix) {
-            /* Declarations first for C90 compliance */
-            double az_a,el_a,be,bn,bu,ndotb,nn,na[3],ea[3];
-            az_a=sdr_sc_ant_az*D2R; el_a=sdr_sc_ant_el*D2R;
-            be=cos(el_a)*sin(az_a); bn=cos(el_a)*cos(az_a); bu=sin(el_a);
-            /* Elevation: projection of satellite LOS onto boresight */
-            el=asin(enu[0]*be+enu[1]*bn+enu[2]*bu);
-            /* Azimuth: n_ant=normalize(ENU_north-(ENU_north·b)b), e_ant=cross(b,n_ant) */
-            ndotb=bn; /* dot([0,1,0], [be,bn,bu]) */
-            na[0]=-ndotb*be; na[1]=1.0-ndotb*bn; na[2]=-ndotb*bu;
-            nn=sqrt(na[0]*na[0]+na[1]*na[1]+na[2]*na[2]);
-            if (dot(enu,enu,2)<1E-12) {
-                az=0.0;
-            } else if (nn>1e-6) {
-                na[0]/=nn; na[1]/=nn; na[2]/=nn;
-                ea[0]=bu*na[1]-bn*na[2];
-                ea[1]=be*na[2]-bu*na[0];
-                ea[2]=bn*na[0]-be*na[1];
-                az=atan2(enu[0]*ea[0]+enu[1]*ea[1]+enu[2]*ea[2],
-                         enu[0]*na[0]+enu[1]*na[1]+enu[2]*na[2]);
-            } else {
-                /* Boresight collinear with ENU north — use standard az */
-                az=atan2(enu[0],enu[1]);
-            }
+
+            double az_a, el_a;
+            double sin_az, cos_az;
+            double sin_el, cos_el;
+            double enu_ant[3];
+
+            az_a = sdr_sc_ant_az * D2R;
+            el_a = sdr_sc_ant_el * D2R;
+
+            sin_az = sin(az_a);
+            cos_az = cos(az_a);
+            sin_el = sin(el_a);
+            cos_el = cos(el_a);
+
+            /* Equivalent to mat_enu2ant() * enu */
+            enu_ant[0] =
+                sin_el * cos_az * enu[0] +
+                sin_el * sin_az * enu[1] -
+                cos_el * enu[2];
+
+            enu_ant[1] =
+            -sin_az * enu[0] +
+                cos_az * enu[1];
+
+            enu_ant[2] =
+                cos_el * cos_az * enu[0] +
+                cos_el * sin_az * enu[1] +
+                sin_el * enu[2];
+
+            az = dot(enu_ant, enu_ant, 2) < 1E-12 ?
+                0.0 : atan2(enu_ant[0], enu_ant[1]);
+
+            el = asin(enu_ant[2]);
         } else {
             az=dot(enu,enu,2)<1E-12?0.0:atan2(enu[0],enu[1]);
             el=asin(enu[2]);

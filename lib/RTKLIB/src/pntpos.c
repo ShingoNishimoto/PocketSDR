@@ -390,6 +390,21 @@ static int estpos(const obsd_t *obs, int n, const double *rs, const double *dts,
 
     for (i=0;i<3;i++) x[i]=sol->rr[i];
 
+    /* when clock is externally known, seed x[3..] from sol->dtr so rescode
+     * can subtract the correct clock bias from pseudorange residuals.
+     * Unit: PMODE_SINGLE stores dtr in seconds; PPP modes store in meters. */
+    if (opt->clock_bias_fixed) {
+        if (opt->mode==PMODE_SINGLE) {
+            x[3]=sol->dtr[0]*CLIGHT; x[4]=sol->dtr[1]*CLIGHT;
+            x[5]=sol->dtr[2]*CLIGHT; x[6]=sol->dtr[3]*CLIGHT;
+            x[7]=sol->dtr[4]*CLIGHT;
+        } else {
+            x[3]=sol->dtr[0]; x[4]=sol->dtr[1];
+            x[5]=sol->dtr[2]; x[6]=sol->dtr[3];
+            x[7]=sol->dtr[4];
+        }
+    }
+
     for (i=0;i<MAXITR;i++) {
 
         /* pseudorange residuals (m) */
@@ -415,9 +430,8 @@ static int estpos(const obsd_t *obs, int n, const double *rs, const double *dts,
                 for (j=0;j<nx;j++) { x[j]+=dxc[j]; dx[j]=dxc[j]; }
                 if (norm(dxc,nx)<1E-4) {
                     sol->type=0;
-                    /* obs time already AOWR-corrected; x[3]=0, no adjustment needed */
-                    sol->time=obs[0].time;
-                    /* dtr: not updated — clock is externally fixed */
+                    sol->time=timeadd(obs[0].time,-x[3]/CLIGHT);
+                    /* dtr[0..] already set by caller with the fixed clock; preserve them */
                     for (j=0;j<6;j++) sol->rr[j]=j<3?x[j]:0.0;
                     for (j=0;j<3;j++) sol->qr[j]=(float)Qc[j+j*nx];
                     sol->qr[3]=(float)Qc[1];

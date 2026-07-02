@@ -960,7 +960,8 @@ static int ppp_res(int post, const obsd_t *obs, int n, const double *rs,
                 default:      k=0; break;
             }
             cdtr=x[IC(k,opt)];
-            H[IC(k,opt)+nx*nv]=1.0;
+            if (!opt->clock_bias_fixed) H[IC(k,opt)+nx*nv]=1.0;
+            /* clock_bias_fixed: cdtr used in residual but H[IC]=0, not estimated */
             
             if (opt->tropopt==TROPOPT_EST||opt->tropopt==TROPOPT_ESTG) {
                 for (k=0;k<(opt->tropopt>=TROPOPT_ESTG?3:1);k++) {
@@ -1071,8 +1072,11 @@ static void update_stat(rtk_t *rtk, const obsd_t *obs, int n, int stat)
         rtk->sol.qr[4]=(float)rtk->P[2+rtk->nx];
         rtk->sol.qr[5]=(float)rtk->P[2];
     }
-    rtk->sol.dtr[0]=rtk->x[IC(0,opt)];
-    rtk->sol.dtr[1]=rtk->x[IC(1,opt)]-rtk->x[IC(0,opt)];
+    if (!rtk->opt.clock_bias_fixed) {
+        rtk->sol.dtr[0]=rtk->x[IC(0,opt)];
+        rtk->sol.dtr[1]=rtk->x[IC(1,opt)]-rtk->x[IC(0,opt)];
+    }
+    /* clock_bias_fixed: sol.dtr[0] retains the externally known clock (set by caller) */
     
     for (i=0;i<n&&i<MAXOBS;i++) for (j=0;j<opt->nf;j++) {
         rtk->ssat[obs[i].sat-1].snr[j]=obs[i].SNR[j];

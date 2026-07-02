@@ -151,10 +151,11 @@ static int get_nch_trk(sdr_rcv_t *rcv, char *sys)
 // print SDR receiver status header --------------------------------------------
 static int print_head(sdr_rcv_t *rcv, char *buff, int size)
 {
-    char solstr[128] = "", sys[16] = "";
+    extern int sdr_ps_sc_mode;
+    char solstr[256] = "", sys[16] = "";
     int n = 0, nch_bb = 0, nch_trk = 0, ch_srch = 0;
     double buff_use = 0.0;
-    
+
     if (rcv) {
         nch_bb = rcv->nch;
         nch_trk = get_nch_trk(rcv, sys);
@@ -162,8 +163,20 @@ static int print_head(sdr_rcv_t *rcv, char *buff, int size)
         buff_use = rcv->stats.buff_use;
         sdr_pvt_solstr(rcv->pvt, solstr, sizeof(solstr));
     }
-    n += ap_str(buff + n, size - n, " %-*s BUFF:%3.0f%% SRCH:%4d LOCK:%4d/%4d\n",
-        NUM_COL - 36, solstr, buff_use, ch_srch, nch_trk, nch_bb);
+    if (sdr_ps_sc_mode) {
+        /* In ps_sc mode solstr is two lines: "SC ...\nREF ...". Split them so
+           BUFF/SRCH/LOCK appears on the SC line and REF appears below it. */
+        char *nl = strchr(solstr, '\n');
+        if (nl) { *nl = '\0'; }
+        n += ap_str(buff + n, size - n, " %-*s BUFF:%3.0f%% SRCH:%4d LOCK:%4d/%4d\n",
+            NUM_COL - 36, solstr, buff_use, ch_srch, nch_trk, nch_bb);
+        if (nl) {
+            n += ap_str(buff + n, size - n, " %s\n", nl + 1);
+        }
+    } else {
+        n += ap_str(buff + n, size - n, " %-*s BUFF:%3.0f%% SRCH:%4d LOCK:%4d/%4d\n",
+            NUM_COL - 36, solstr, buff_use, ch_srch, nch_trk, nch_bb);
+    }
     n += ap_str(buff + n, size - n, "%4s %2s %4s %5s %3s %8s %4s %-12s %11s "
         "%7s %11s %4s %5s %4s %4s %3s\n", "CH", "RF", "SAT", "SIG", "PRN",
         "LOCK(s)", "C/N0", "(dB-Hz)", "COFF(ms)", "DOP(Hz)", "ADR(cyc)", "SYNC",
@@ -1922,7 +1935,7 @@ void sdr_rcv_close(sdr_rcv_t *rcv)
 //
 void sdr_rcv_setopt(const char *opt, double value)
 {
-    extern double sdr_epoch, sdr_lag_epoch, sdr_el_mask, sdr_sp_corr, sdr_t_acq;
+    extern double sdr_epoch, sdr_lag_epoch, sdr_el_mask, sdr_maxgdop, sdr_sp_corr, sdr_t_acq;
     extern double sdr_t_dll, sdr_b_dll, sdr_b_pll, sdr_b_fll_w, sdr_b_fll_n;
     extern double sdr_max_dop, sdr_thres_cn0_l, sdr_thres_cn0_u;
     extern double sdr_t_acq_L2, sdr_t_dll_L2, sdr_thres_cn0_l_L2, sdr_thres_cn0_u_L2;
@@ -1938,6 +1951,7 @@ void sdr_rcv_setopt(const char *opt, double value)
     if      (!strcmp(opt, "epoch"      )) sdr_epoch       = value;
     else if (!strcmp(opt, "lag_epoch"  )) sdr_lag_epoch   = value;
     else if (!strcmp(opt, "el_mask"    )) sdr_el_mask     = value;
+    else if (!strcmp(opt, "maxgdop"    )) sdr_maxgdop     = value;
     else if (!strcmp(opt, "sp_corr"    )) sdr_sp_corr     = value;
     else if (!strcmp(opt, "t_acq"      )) sdr_t_acq       = value;
     else if (!strcmp(opt, "t_dll"      )) sdr_t_dll       = value;

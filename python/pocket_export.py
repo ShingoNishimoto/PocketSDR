@@ -89,6 +89,66 @@ def parse_log(path):
     return rows
 
 
+def parse_sc_aowr_log(path):
+    """Parse $LOG,<t>,SC_AOWR entries and return a dict keyed by t.
+
+    Line format:  $LOG,<t>,SC_AOWR clk=<float> drift=<float> dt=<float> hist=<int>
+    Returns: {t: {'clk': float, 'drift': float, 'dt': float, 'hist': int}, ...}
+    """
+    result = {}
+    with open(path, errors='replace') as f:
+        for line in f:
+            line = line.strip()
+            if not line.startswith('$LOG,'):
+                continue
+            p = line.split(',', 2)
+            if len(p) < 3 or not p[2].startswith('SC_AOWR '):
+                continue
+            try:
+                t     = float(p[1])
+                msg   = p[2]
+                clk   = float(msg.split('clk=')[1].split()[0])
+                drift = float(msg.split('drift=')[1].split()[0])
+                dt    = float(msg.split('dt=')[1].split()[0])
+                hist  = int(msg.split('hist=')[1].split()[0])
+                result[t] = {'clk': clk, 'drift': drift, 'dt': dt, 'hist': hist}
+            except (ValueError, IndexError):
+                continue
+    return result
+
+
+def parse_spp_seed_log(path, tag):
+    """Parse $LOG entries with a given tag and return a dict keyed by t.
+
+    Handles tags emitted by sdr_pvt.c:
+      SPP_SEED     – main SPP seed (AOWR-corrected obs; dtr=0 when clock fixed)
+      REF_SPP_SEED – reference SPP seed in PPP mode (uncorrected obs, free clock)
+      REF_SPP      – reference SPP in SPP mode (uncorrected obs, free clock)
+
+    Line format:  $LOG,<t>,<tag> stat=<int> dtr=<float> [msg=<str>]
+    Returns: {t: {'stat': int, 'dtr': float}, ...}
+    """
+    result = {}
+    prefix = tag + ' '
+    with open(path, errors='replace') as f:
+        for line in f:
+            line = line.strip()
+            if not line.startswith('$LOG,'):
+                continue
+            p = line.split(',', 2)
+            if len(p) < 3 or not p[2].startswith(prefix):
+                continue
+            try:
+                t    = float(p[1])
+                msg  = p[2]
+                stat = int(msg.split('stat=')[1].split()[0])
+                dtr  = float(msg.split('dtr=')[1].split()[0])
+                result[t] = {'stat': stat, 'dtr': dtr}
+            except (ValueError, IndexError):
+                continue
+    return result
+
+
 def parse_refpos_log(path):
     """Return list of dicts parsed from $REFPOS lines (reference/uncorrected solver).
 
@@ -284,9 +344,13 @@ def write_geojson(rows, path, label=''):
 def make_df(rows):
     """Build a DataFrame from $POS or $REFPOS row dicts.
 
-    Optional fields (ecef, velocity, DOP) use .get() so the same function
-    works for both row types; missing values become NaN.
+    Optional fields (ecef, velocity, DOP, SPP seed clocks) use .get() so the
+    same function works for both row types; missing values become NaN.
+    SPP seed clock fields are merged into row dicts by main() before this call:
+      spp_seed_stat / spp_seed_dtr_s  – main SPP seed (AOWR-corrected)
+      ref_spp_stat  / ref_spp_dtr_s   – reference SPP seed (uncorrected, free clock)
     """
+    _nan = float('nan')
     return pd.DataFrame([{
         't_s':           r['t'],
         'datetime_gpst': gpst_str(r),
@@ -295,13 +359,13 @@ def make_df(rows):
         'lon_deg':       r['lon'],
         'hgt_m':         r['hgt'],
         # ECEF position (NaN for $REFPOS rows which don't carry ECEF)
-        'ecef_x_m':      r.get('ecef_x', float('nan')),
-        'ecef_y_m':      r.get('ecef_y', float('nan')),
-        'ecef_z_m':      r.get('ecef_z', float('nan')),
+        'ecef_x_m':      r.get('ecef_x', _nan),
+        'ecef_y_m':      r.get('ecef_y', _nan),
+        'ecef_z_m':      r.get('ecef_z', _nan),
         # ECEF velocity (non-zero only in kinematic PPP; NaN for $REFPOS)
-        'vel_x_m_s':     r.get('vel_x', float('nan')),
-        'vel_y_m_s':     r.get('vel_y', float('nan')),
-        'vel_z_m_s':     r.get('vel_z', float('nan')),
+        'vel_x_m_s':     r.get('vel_x', _nan),
+        'vel_y_m_s':     r.get('vel_y', _nan),
+        'vel_z_m_s':     r.get('vel_z', _nan),
         # Solution quality
         'quality':       r['q'],
         'quality_label': SOLQ_LABEL.get(r['q'], str(r['q'])),
@@ -313,10 +377,18 @@ def make_df(rows):
         # DOP (NaN for old logs without DOP fields)
         # For $POS (clock-corrected): gdop=0, pdop=PDOP3 (position-only, no clock coupling)
         # For $REFPOS (4-unknown):    gdop=GDOP, pdop=PDOP with clock-position coupling
-        'gdop':          r.get('gdop', float('nan')),
-        'pdop':          r.get('pdop', float('nan')),
-        'hdop':          r.get('hdop', float('nan')),
-        'vdop':          r.get('vdop', float('nan')),
+        'gdop':          r.get('gdop', _nan),
+        'pdop':          r.get('pdop', _nan),
+        'hdop':          r.get('hdop', _nan),
+        'vdop':          r.get('vdop', _nan),
+        # SPP seed receiver clock offsets (debug; NaN when not in -ps_sc mode or no fix)
+        'spp_seed_stat':  r.get('spp_seed_stat', _nan),
+        'spp_seed_dtr_s': r.get('spp_seed_dtr',  _nan),
+        'ref_spp_stat':   r.get('ref_spp_stat',  _nan),
+        'ref_spp_dtr_s':  r.get('ref_spp_dtr',   _nan),
+        # SC_AOWR clock estimate and drift rate (NaN when AOWR not yet active)
+        'sc_aowr_clk_s':  r.get('sc_aowr_clk',   _nan),
+        'sc_aowr_drift':  r.get('sc_aowr_drift',  _nan),
     } for r in rows])
 
 def write_csv(rows, path, label=''):
@@ -376,6 +448,30 @@ def main():
     spp_n = len(rows) - ppp_n
     print(f'Parsed {len(rows)} $POS records from {args.logfile}'
           f'  ({ppp_n} PPP, {spp_n} SPP)')
+
+    # Merge SPP seed clock entries into rows for debug export.
+    # REF_SPP_SEED (PPP mode) and REF_SPP (SPP mode) both carry the reference
+    # solver clock; combine them into a single lookup.
+    spp_clk = parse_spp_seed_log(args.logfile, 'SPP_SEED')
+    ref_spp_clk = {**parse_spp_seed_log(args.logfile, 'REF_SPP_SEED'),
+                   **parse_spp_seed_log(args.logfile, 'REF_SPP')}
+    if spp_clk or ref_spp_clk:
+        for r in rows:
+            if r['t'] in spp_clk:
+                r['spp_seed_stat'] = spp_clk[r['t']]['stat']
+                r['spp_seed_dtr']  = spp_clk[r['t']]['dtr']
+            if r['t'] in ref_spp_clk:
+                r['ref_spp_stat'] = ref_spp_clk[r['t']]['stat']
+                r['ref_spp_dtr']  = ref_spp_clk[r['t']]['dtr']
+        print(f'Merged {len(spp_clk)} SPP_SEED and {len(ref_spp_clk)} REF_SPP clock entries')
+
+    sc_aowr = parse_sc_aowr_log(args.logfile)
+    if sc_aowr:
+        for r in rows:
+            if r['t'] in sc_aowr:
+                r['sc_aowr_clk']   = sc_aowr[r['t']]['clk']
+                r['sc_aowr_drift'] = sc_aowr[r['t']]['drift']
+        print(f'Merged {len(sc_aowr)} SC_AOWR clock/drift entries')
 
     ref_rows = parse_refpos_log(args.logfile)
     if ref_rows:

@@ -37,7 +37,7 @@ cp $conffile $date_str
 # run
 pocket_trk \
     -c $conffile \
-    -sig L1CA,L2CM -prn 1-32,159,193-202 -ps_prn 159 -rfch 3,4 -f 4 -IQ 2 -ppps -ps_sc \
+    -sig L1CA,L2CM -prn 1-32,159,193-202 -ps_prn 159 -rfch 3,4 -f 4 -IQ 2 -ppp -ps_sc \
     -ps_sc_file $aowr_file \
     -opt $confpath/ppp_kinematic_drone.ini \
     $(build_nav_args) \

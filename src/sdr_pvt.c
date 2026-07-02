@@ -39,6 +39,7 @@
 double sdr_epoch     = SDR_EPOCH;
 double sdr_lag_epoch = LAG_EPOCH;
 double sdr_el_mask   = EL_MASK;
+double sdr_maxgdop   = 30.0;   /* reject threshold of gdop (default: 30.0) */
 int    sdr_ionoopt   = IONOOPT_BRDC;
 int    sdr_pmode     = PMODE_SINGLE;
 double sdr_fixpos[3] = {0.0};  // known ECEF position for fixed-position mode (m)
@@ -303,9 +304,12 @@ static void out_log_pos(double time, const sol_t *sol, int nsat,
                         const ssat_t *ssat)
 {
     double ep[6], pos[3], P[9], Q[9], dop[4] = {0};
-    /* In PPP mode, RTKLIB stores sol->dtr[0] = x[IC_GPS] in meters (not seconds).
-       Convert to seconds for time display and dtr field output. */
-    double dtr_s = (sdr_pmode >= PMODE_PPP_KINEMA) ? sol->dtr[0] / CLIGHT : sol->dtr[0];
+    /* RTKLIB stores sol->dtr[0] in meters after pppos (PPP mode) or in seconds
+       after pntpos (SPP/SINGLE mode).  clock_bias_fixed overrides this: the caller
+       pre-loads sol->dtr[0] = clock_est (seconds) and pppos leaves it untouched. */
+    int clock_bias_fixed = sdr_ps_sc_mode && s_sc_hist_n > 0;
+    int dtr_in_meters    = (sdr_pmode >= PMODE_PPP_KINEMA) && !clock_bias_fixed;
+    double dtr_s         = dtr_in_meters ? sol->dtr[0] / CLIGHT : sol->dtr[0];
     time2epoch(timeadd(sol->time, dtr_s), ep);
     ecef2pos(sol->rr, pos);
     P[0] = sol->qr[0];
@@ -948,6 +952,7 @@ sdr_pvt_t *sdr_pvt_new(sdr_rcv_t *rcv)
             opt.modear = ARMODE_OFF; /* float bias only */
         }
         opt.elmin   = sdr_el_mask * D2R;
+        opt.maxgdop = sdr_maxgdop;
         opt.dynamics = sdr_dynamics;
         if (sdr_prnaccelh >= 0.0) opt.prn[3] = sdr_prnaccelh;
         if (sdr_prnaccv   >= 0.0) opt.prn[4] = sdr_prnaccv;
@@ -1567,7 +1572,8 @@ static void update_sol(sdr_pvt_t *pvt)
     obsd_t obs[MAXSAT];
     obsd_t obs_ref[MAXSAT]; /* uncorrected obs for SC reference solver */
     int mask[MAXSAT] = {0}, nobs = 0;
-    int nobs_ref = 0, run_ref_sol = 0;
+    int nobs_ref = 0, run_ref_sol = 0, sc_clk_ready = 0;
+    double clock_est = 0.0; /* AOWR-derived clock applied to obs (0 when not in SC mode) */
     char msg[128] = "";
 
     // deduplicate: one entry per satellite (L1+L2 merged in same obsd_t)
@@ -1615,6 +1621,14 @@ static void update_sol(sdr_pvt_t *pvt)
         // update_aowr is now called at 20 ms rate from sdr_pvt_udobs()
     }
 
+    // SC mode: always save uncorrected obs for the reference solver.
+    // Reference solver runs on raw obs regardless of AOWR clock availability.
+    if (sdr_ps_sc_mode && nobs > 0) {
+        memcpy(obs_ref, obs, sizeof(obsd_t) * nobs);
+        nobs_ref    = nobs;
+        run_ref_sol = 1;
+    }
+
     // SC mode: extrapolate AOWR clock to current epoch using WLS drift estimation,
     // then pre-correct obs so pntpos/pppos solve position only (3 unknowns).
     // Mirrors linear_regression_by_wls + rx_clock_offset_est in rtklib_pvt_gs.cc.
@@ -1659,34 +1673,19 @@ static void update_sol(sdr_pvt_t *pvt)
             }
         }
 
-        /* (c) Extrapolate clock to current epoch and pre-correct obs */
+        /* (c) Extrapolate AOWR clock and pre-correct obs when clock data available */
         if (s_sc_rx_clock != 0.0 && s_sc_hist_n > 0 && nobs > 0) {
             int wn;
             double current_tow = time2gpst(obs[0].time, &wn);
-            double clock_est   = s_sc_dt_i +
+            clock_est          = s_sc_dt_i +
                                  s_sc_clock_drift * (current_tow - s_sc_tow_hist[0]);
+            sc_clk_ready       = 1;
 
             sdr_log(3, "$LOG,%.3f,SC_AOWR clk=%.9f drift=%.3e dt=%.3f hist=%d",
                 time, clock_est, s_sc_clock_drift,
                 current_tow - s_sc_tow_hist[0], s_sc_hist_n);
-
-            /* Save uncorrected obs for parallel reference solver */
-            memcpy(obs_ref, obs, sizeof(obsd_t) * nobs);
-            nobs_ref    = nobs;
-            run_ref_sol = 1;
-
-            /* Pre-correct observations with extrapolated clock */
-            for (int i = 0; i < nobs; i++) {
-                obs[i].time = timeadd(obs[i].time, -clock_est);
-                for (int j = 0; j < NFREQ + NEXOBS; j++) {
-                    if (obs[i].P[j] != 0.0)
-                        obs[i].P[j] -= clock_est * CLIGHT;
-                    if (obs[i].L[j] != 0.0) {
-                        double freq = sat2freq(obs[i].sat, obs[i].code[j], pvt->nav);
-                        if (freq > 0.0) obs[i].L[j] -= clock_est * freq;
-                    }
-                }
-            }
+            /* Observations used as-is; clock offset passed via sol.dtr[0] so
+             * pntpos/pppos subtract it in range residuals (clock_bias_fixed=1). */
         }
     }
 
@@ -1696,12 +1695,23 @@ static void update_sol(sdr_pvt_t *pvt)
         pvt->rtk->tt = pvt->rtk->sol.time.time > 0 ?
             timediff(obs_time, pvt->rtk->sol.time) : 0.0;
 
+        sol_t spp_sol = {0};
+        if (sdr_ps_sc_mode && !sc_clk_ready) {
+            /* SC mode but no AOWR clock yet: suppress main solver, keep KF frozen */
+            pvt->rtk->sol.stat = 0;
+            pvt->rtk->sol.time = obs_time; /* advance time for next epoch's tt */
+            sdr_log(3, "$LOG,%.3f,SPP_SEED SUPPRESSED (SC no clock)", time);
+        } else {
         // Seed pppos EKF with SPP position (pppos needs rtk->sol.rr != {0,0,0})
         // This also sets rtk->sol.time = obs_time for next epoch's tt computation.
         prcopt_t spopt = prcopt_default;
         spopt.navsys |= SYS_GLO | SYS_GAL | SYS_QZS | SYS_CMP | SYS_IRN;
-        spopt.elmin = sdr_el_mask * D2R;
-        if (run_ref_sol) spopt.clock_bias_fixed = 1; /* obs pre-corrected → 3-unknown */
+        spopt.elmin   = sdr_el_mask * D2R;
+        spopt.maxgdop = sdr_maxgdop;
+        if (sc_clk_ready) {
+            spopt.clock_bias_fixed = 1; /* P/L pre-corrected → 3-unknown solve */
+            pvt->rtk->sol.dtr[0] = clock_est; /* fixed clock bias (seconds) */
+        }
         // Pass pvt->rtk->ssat so pntpos sets ssat[sat].vs=1; pppos needs vs=1 to accept obs
         // In fixed-position mode, seed pntpos from the known position for a better clock estimate.
         if (sdr_pmode == PMODE_PPP_FIXED && norm(sdr_fixpos, 3) > 1.0) {
@@ -1709,9 +1719,23 @@ static void update_sol(sdr_pvt_t *pvt)
             pvt->rtk->sol.rr[1] = sdr_fixpos[1];
             pvt->rtk->sol.rr[2] = sdr_fixpos[2];
         }
-        sol_t spp_sol = {0};  // save SPP result in case PPP fails (L1-only, no L2 yet)
+        // When using clock_bias_fixed, position must be seeded from somewhere non-zero.
+        // Starting from geocenter (0,0,0) makes all sats appear at el=90° → degenerate PDOP.
+        // REF solver runs from epoch 0 (before AOWR clock arrives), so by the time
+        // sc_clk_ready=1, s_sc_ref_rtk->sol.rr already has a converged position.
+        if (sc_clk_ready && norm(pvt->rtk->sol.rr, 3) < 1.0 &&
+            s_sc_ref_rtk && norm(s_sc_ref_rtk->sol.rr, 3) > 1.0) {
+            pvt->rtk->sol.rr[0] = s_sc_ref_rtk->sol.rr[0];
+            pvt->rtk->sol.rr[1] = s_sc_ref_rtk->sol.rr[1];
+            pvt->rtk->sol.rr[2] = s_sc_ref_rtk->sol.rr[2];
+            sdr_log(3, "$LOG,%.3f,SPP_SEED seeded from REF pos %.1f %.1f %.1f",
+                time, pvt->rtk->sol.rr[0], pvt->rtk->sol.rr[1], pvt->rtk->sol.rr[2]);
+        }
         pntpos(obs, nobs, pvt->nav, &spopt, &pvt->rtk->sol, NULL, pvt->rtk->ssat, msg);
         if (pvt->rtk->sol.stat) spp_sol = pvt->rtk->sol;
+        sdr_log(3, "$LOG,%.3f,SPP_SEED stat=%d dtr=%.9f msg=%s",
+            time, pvt->rtk->sol.stat, pvt->rtk->sol.dtr[0],
+            pvt->rtk->sol.stat ? "ok" : msg);
 
         // Initialize clock states from pntpos when x[IC]=0.
         // udclk_ppp() initializes clocks only when norm(x[0:3])=0, but udpos_ppp()
@@ -1738,6 +1762,7 @@ static void update_sol(sdr_pvt_t *pvt)
 
         // PPP: dual-frequency Kalman filter via pppos()
         pppos(pvt->rtk, obs, nobs, pvt->nav);
+        } /* end else (sc_clk_ready) */
 
         // Reference PPP: normal PPP on uncorrected obs for SC AOWR evaluation.
         // Independent KF state in s_sc_ref_rtk; result logged as $REFPOS.
@@ -1749,9 +1774,12 @@ static void update_sol(sdr_pvt_t *pvt)
             // Seed reference RTK position from normal SPP on uncorrected obs
             prcopt_t rspopt = prcopt_default;
             rspopt.navsys |= SYS_GLO | SYS_GAL | SYS_QZS | SYS_CMP | SYS_IRN;
-            rspopt.elmin = sdr_el_mask * D2R;
+            rspopt.elmin   = sdr_el_mask * D2R;
+            rspopt.maxgdop = sdr_maxgdop;
             pntpos(obs_ref, nobs_ref, pvt->nav, &rspopt, &s_sc_ref_rtk->sol,
                    NULL, s_sc_ref_rtk->ssat, msg);
+            sdr_log(3, "$LOG,%.3f,REF_SPP_SEED stat=%d dtr=%.9f",
+                time, s_sc_ref_rtk->sol.stat, s_sc_ref_rtk->sol.dtr[0]);
 
             // Seed reference clock states when not yet initialized
             {
@@ -1785,11 +1813,13 @@ static void update_sol(sdr_pvt_t *pvt)
                 }
             }
 
-            // Log reference PPP result (DOP from reference ssat — 4-unknown set)
+            // Log reference PPP/SPP result (DOP from reference ssat — 4-unknown set)
             const sol_t *rsol = &s_sc_ref_rtk->sol;
             if (rsol->stat) {
                 double ep[6], pos[3], rP9[9], Q[9], rdop[4] = {0};
-                double rdtr = rsol->dtr[0] / CLIGHT; /* PPP: meters→seconds */
+                /* dtr[0] is in meters after pppos (PPP, stat=6), seconds after pntpos (SPP). */
+                double rdtr = (rsol->stat == SOLQ_PPP)
+                              ? rsol->dtr[0] / CLIGHT : rsol->dtr[0];
                 time2epoch(timeadd(rsol->time, rdtr), ep);
                 ecef2pos(rsol->rr, pos);
                 rP9[0]=rsol->qr[0]; rP9[4]=rsol->qr[1]; rP9[8]=rsol->qr[2];
@@ -1895,11 +1925,17 @@ static void update_sol(sdr_pvt_t *pvt)
         opt.err[1] = opt.err[2] = STD_ERR;
         opt.ionoopt = sdr_ionoopt;
         opt.tropopt = TROPOPT_SAAS;
-        opt.elmin = sdr_el_mask * D2R;
+        opt.elmin   = sdr_el_mask * D2R;
+        opt.maxgdop = sdr_maxgdop;
         opt.posopt[4] = 1; // RAIM-FDE
-        if (run_ref_sol) opt.clock_bias_fixed = 1; /* obs pre-corrected → 3-unknown */
+        if (sc_clk_ready) opt.clock_bias_fixed = 1; /* obs pre-corrected → 3-unknown */
 
-        if (pntpos(obs, nobs, pvt->nav, &opt, pvt->sol, NULL, pvt->ssat, msg)) {
+        if (sdr_ps_sc_mode && !sc_clk_ready) {
+            /* SC mode but no AOWR clock yet: suppress main solution */
+            update_azel(pvt->nav, pvt->sol, pvt->ssat);
+            pvt->sol->ns = 0;
+            sdr_log(3, "$LOG,%.3f,PNTPOS SUPPRESSED (SC no clock)", time);
+        } else if (pntpos(obs, nobs, pvt->nav, &opt, pvt->sol, NULL, pvt->ssat, msg)) {
             output_sol(pvt, time);
         } else {
             update_azel(pvt->nav, pvt->sol, pvt->ssat);
@@ -1918,11 +1954,15 @@ static void update_sol(sdr_pvt_t *pvt)
         ref_opt.ionoopt = sdr_ionoopt;
         ref_opt.tropopt = TROPOPT_SAAS;
         ref_opt.elmin   = sdr_el_mask * D2R;
+        ref_opt.maxgdop = sdr_maxgdop;
         ref_opt.posopt[4] = 1; /* RAIM-FDE */
         sol_t ref_sol = {0};
         double ref_azel[MAXSAT * 2] = {0}; /* azel from 4-unknown solve for DOP */
-        if (pntpos(obs_ref, nobs_ref, pvt->nav, &ref_opt, &ref_sol,
-                   ref_azel, NULL, msg)) {
+        int ref_stat = pntpos(obs_ref, nobs_ref, pvt->nav, &ref_opt, &ref_sol,
+                              ref_azel, NULL, msg);
+        sdr_log(3, "$LOG,%.3f,REF_SPP stat=%d dtr=%.9f msg=%s",
+            time, ref_sol.stat, ref_sol.dtr[0], ref_stat ? "" : msg);
+        if (ref_stat) {
             double ep[6], pos[3], P[9], Q[9], rdop[4] = {0};
             double dtr_s = ref_sol.dtr[0];
             time2epoch(timeadd(ref_sol.time, dtr_s), ep);
@@ -2046,10 +2086,12 @@ void sdr_pvt_udsol(sdr_pvt_t *pvt, int64_t ix)
         pvt->nch = pvt->obs->n = 0; 
         
         // adjust epoch cycle within 20 ms
-        // pntpos (SPP) stores sol.dtr in seconds; pppos (PPP) stores in meters
+        // pntpos (SPP) stores sol.dtr in seconds; pppos (PPP) stores in meters.
+        // Exception: SC AOWR mode (clock_bias_fixed) stores dtr in seconds even in PPP mode.
         if (pvt->sol->stat) {
             double dtr_s = pvt->sol->dtr[0];
-            if (sdr_pmode >= PMODE_PPP_KINEMA) dtr_s /= CLIGHT;
+            if (sdr_pmode >= PMODE_PPP_KINEMA && !(sdr_ps_sc_mode && s_sc_hist_n > 0))
+                dtr_s /= CLIGHT;
             double dtr = ROUND(dtr_s / 0.02) * 0.02;
             if (fabs(dtr) > 0.01) {
                 pvt->ix += (int)(dtr / SDR_CYC);
@@ -2092,7 +2134,32 @@ void sdr_pvt_solstr(sdr_pvt_t *pvt, char *buff, int size)
 
     tstr[4] = tstr[7] = '-';
     snprintf(nstr, sizeof(nstr), "%d/%d", pvt->sol->ns, pvt->nsat);
-    snprintf(buff, size, "%21s %12.8f %13.8f %9.3f %5s %s", tstr, pos[0] * R2D,
-        pos[1] * R2D, pos[2], nstr,
-        solq[stat >= 0 && stat < 8 ? stat : 0]);
+
+    if (sdr_ps_sc_mode && s_sc_ref_rtk) {
+        /* ps_sc mode: show AOWR-corrected (SC) and uncorrected (REF) solutions */
+        char rtstr[32] = "", rnstr[16] = "";
+        double rpos[3] = {0};
+        int rstat = 0;
+        const sol_t *rsol = &s_sc_ref_rtk->sol;
+        if (norm(rsol->rr, 3) > 1e-6) {
+            time2str(rsol->time, rtstr, 1);
+            ecef2pos(rsol->rr, rpos);
+            rstat = rsol->stat;
+        } else {
+            time2str(pvt->time, rtstr, 1);
+        }
+        rtstr[4] = rtstr[7] = '-';
+        snprintf(rnstr, sizeof(rnstr), "%d/%d", rsol->ns, pvt->nsat);
+        snprintf(buff, size,
+            "SC %21s %12.8f %13.8f %9.3f %5s %s\n"
+            "REF%21s %12.8f %13.8f %9.3f %5s %s",
+            tstr,  pos[0]*R2D,  pos[1]*R2D,  pos[2],  nstr,
+            solq[stat  >= 0 && stat  < 8 ? stat  : 0],
+            rtstr, rpos[0]*R2D, rpos[1]*R2D, rpos[2], rnstr,
+            solq[rstat >= 0 && rstat < 8 ? rstat : 0]);
+    } else {
+        snprintf(buff, size, "%21s %12.8f %13.8f %9.3f %5s %s", tstr, pos[0] * R2D,
+            pos[1] * R2D, pos[2], nstr,
+            solq[stat >= 0 && stat < 8 ? stat : 0]);
+    }
 }
