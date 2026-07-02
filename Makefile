@@ -4,14 +4,15 @@ ifdef SUDO_USER
 else
   _REAL_HOME := $(HOME)
 endif
-BINDIR   ?= $(_REAL_HOME)/bin
+BINDIR   ?= /usr/local/bin
 BINS     = $(wildcard bin/pocket_* bin/fftw_wisdom)
 LIBDIR   = lib/build
+USE_FFTW ?= 1
 
 all:
-	$(MAKE) -C $(LIBDIR)
-	$(MAKE) -C $(LIBDIR) install
-	$(MAKE) -C app
+	$(MAKE) -C $(LIBDIR) USE_FFTW=$(USE_FFTW)
+	$(MAKE) -C $(LIBDIR) install USE_FFTW=$(USE_FFTW)
+	$(MAKE) -C app USE_FFTW=$(USE_FFTW)
 
 clean:
 	$(MAKE) -C $(LIBDIR) clean
@@ -19,11 +20,7 @@ clean:
 
 install:
 	mkdir -p $(BINDIR)
-	$(MAKE) -C app install BIN=$(abspath $(BINDIR))
-ifdef SUDO_USER
-	chown -R $(SUDO_USER):$(SUDO_USER) $(abspath $(BINDIR))/pocket_* \
-	    $(abspath $(BINDIR))/fftw_wisdom $(abspath $(BINDIR))/convbin 2>/dev/null || true
-endif
+	$(MAKE) -C app install BIN=$(abspath $(BINDIR)) USE_FFTW=$(USE_FFTW)
 
 uninstall:
 	cd $(BINDIR) && rm -f $(notdir $(BINS))
