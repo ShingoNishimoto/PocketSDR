@@ -92,6 +92,12 @@ static double s_sc_dt_i        = 0.0;  // WLS intercept at tow_hist[0] (s)
 static double s_sc_clock_drift = 0.0;  // WLS clock drift rate (s/s)
 static rtk_t *s_sc_ref_rtk    = NULL; // reference PPP solver (uncorrected obs)
 
+/* SC antenna attitude — defined in lib/RTKLIB/src/rtkcmn.c (keeps librtk.a self-contained).
+ * Set at startup from the options file; satazel() reads them in the antenna-frame path. */
+extern int    sdr_sc_ant_fix;   // 0: standard ENU (terrestrial), 1: fixed SC antenna attitude
+extern double sdr_sc_ant_az;    // boresight azimuth (deg)
+extern double sdr_sc_ant_el;    // boresight elevation (deg; -90 = nadir toward Earth center)
+
 int    sdr_dynamics  = 0;      // enable dynamics model for kinematic PPP
 double sdr_prnaccelh = -1.0;   // horizontal acceleration process noise (m/s²), <0 = use RTKLIB default
 double sdr_prnaccv   = -1.0;   // vertical acceleration process noise (m/s²), <0 = use RTKLIB default

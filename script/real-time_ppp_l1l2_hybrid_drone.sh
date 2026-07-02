@@ -39,7 +39,7 @@ pocket_trk \
     -c $conffile \
     -sig L1CA,L2CM -prn 1-32,159,193-202 -ps_prn 159 -rfch 3,4 -f 4 -IQ 2 -ppps -ps_sc \
     -ps_sc_file $aowr_file \
-    -opt $confpath/ppp_l2_opt.ini \
+    -opt $confpath/ppp_kinematic_drone.ini \
     $(build_nav_args) \
     -log $date_str/pocket.log -nmea /dev/ttyUSB0 \
     -debug $date_str/trace.log

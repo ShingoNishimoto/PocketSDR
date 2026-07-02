@@ -3551,15 +3551,48 @@ extern double geodist(const double *rs, const double *rr, double *e)
 *                               (0.0<=azel[0]<2*pi,-pi/2<=azel[1]<=pi/2)
 * return : elevation angle (rad)
 *-----------------------------------------------------------------------------*/
+/* SC antenna attitude globals — defined here so librtk.a is self-contained.
+ * sdr_pvt.c declares these extern and sets them at startup from the options file.
+ * Default fix=0 leaves standard ENU behaviour unchanged for terrestrial receivers. */
+int    sdr_sc_ant_fix = 0;     /* 0: standard ENU, 1: fixed SC antenna attitude */
+double sdr_sc_ant_az  = 0.0;   /* boresight azimuth (deg) */
+double sdr_sc_ant_el  = -90.0; /* boresight elevation (deg; -90 = nadir) */
+
 extern double satazel(const double *pos, const double *e, double *azel)
 {
     double az=0.0,el=PI/2.0,enu[3];
-    
+
     if (pos[2]>-RE_WGS84) {
         ecef2enu(pos,e,enu);
-        az=dot(enu,enu,2)<1E-12?0.0:atan2(enu[0],enu[1]);
+        if (sdr_sc_ant_fix) {
+            /* Declarations first for C90 compliance */
+            double az_a,el_a,be,bn,bu,ndotb,nn,na[3],ea[3];
+            az_a=sdr_sc_ant_az*D2R; el_a=sdr_sc_ant_el*D2R;
+            be=cos(el_a)*sin(az_a); bn=cos(el_a)*cos(az_a); bu=sin(el_a);
+            /* Elevation: projection of satellite LOS onto boresight */
+            el=asin(enu[0]*be+enu[1]*bn+enu[2]*bu);
+            /* Azimuth: n_ant=normalize(ENU_north-(ENU_north·b)b), e_ant=cross(b,n_ant) */
+            ndotb=bn; /* dot([0,1,0], [be,bn,bu]) */
+            na[0]=-ndotb*be; na[1]=1.0-ndotb*bn; na[2]=-ndotb*bu;
+            nn=sqrt(na[0]*na[0]+na[1]*na[1]+na[2]*na[2]);
+            if (dot(enu,enu,2)<1E-12) {
+                az=0.0;
+            } else if (nn>1e-6) {
+                na[0]/=nn; na[1]/=nn; na[2]/=nn;
+                ea[0]=bu*na[1]-bn*na[2];
+                ea[1]=be*na[2]-bu*na[0];
+                ea[2]=bn*na[0]-be*na[1];
+                az=atan2(enu[0]*ea[0]+enu[1]*ea[1]+enu[2]*ea[2],
+                         enu[0]*na[0]+enu[1]*na[1]+enu[2]*na[2]);
+            } else {
+                /* Boresight collinear with ENU north — use standard az */
+                az=atan2(enu[0],enu[1]);
+            }
+        } else {
+            az=dot(enu,enu,2)<1E-12?0.0:atan2(enu[0],enu[1]);
+            el=asin(enu[2]);
+        }
         if (az<0.0) az+=2*PI;
-        el=asin(enu[2]);
     }
     if (azel) {azel[0]=az; azel[1]=el;}
     return el;
