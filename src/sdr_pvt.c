@@ -71,6 +71,27 @@ static double           s_rx_clock_s       = 0.0; // last receiver clock offset 
 static int              s_rx_sol_valid     = 0;   // 1 when PVT solution is valid
 static double           s_gs_last_dt_aowr  = 0.0; // last valid dt_aowr_cp (s), frozen after PS loss
 static int              s_gs_ps_ever_obs   = 0;   // 1 once PS has been observed (never reset)
+int    sdr_ps_sc_mode  = 0;     // SC mode: read AOWR clock offset from file (0: disabled)
+char   sdr_ps_sc_file[256] = "./dt_aowr_gnss.txt"; // input file: dt_aowr_gnss.txt from SC AOWR process
+
+// SC binary seqlock file — matches hybrid_shared_data in gnss-sdr rtklib_pvt_gs.h
+// Layout: 2 slots of aowr_gs_shared_t (64 bytes total); reader uses slot 0 only.
+#define SC_FILE_SIZE       ((int)(sizeof(aowr_gs_shared_t) * 2))  // 64 bytes
+// Clock history for WLS drift estimation (mirrors linear_regression_by_wls in gnss-sdr).
+#define SC_CLOCK_HIST_SIZE 10
+
+static int    s_sc_fd          = -1;
+static void  *s_sc_map         = NULL;
+static double s_sc_last_dt_aowr = 0.0; // last valid dt_aowr_cp on SC side
+static int    s_sc_ps_ever_obs  = 0;   // 1 once PS has been observed on SC side
+static double s_sc_rx_clock     = 0.0; // latest AOWR-derived clock offset (s)
+static double s_sc_clk_hist[SC_CLOCK_HIST_SIZE]; // rx clock offset at each reading
+static double s_sc_tow_hist[SC_CLOCK_HIST_SIZE]; // SC GNSS TOW at each reading
+static int    s_sc_hist_n      = 0;    // valid entries (0..SC_CLOCK_HIST_SIZE)
+static double s_sc_dt_i        = 0.0;  // WLS intercept at tow_hist[0] (s)
+static double s_sc_clock_drift = 0.0;  // WLS clock drift rate (s/s)
+static rtk_t *s_sc_ref_rtk    = NULL; // reference PPP solver (uncorrected obs)
+
 int    sdr_dynamics  = 0;      // enable dynamics model for kinematic PPP
 double sdr_prnaccelh = -1.0;   // horizontal acceleration process noise (m/s²), <0 = use RTKLIB default
 double sdr_prnaccv   = -1.0;   // vertical acceleration process noise (m/s²), <0 = use RTKLIB default
@@ -216,11 +237,43 @@ static void out_log_obs(double time, const obs_t *obs, const nav_t *nav)
 }
 
 //------------------------------------------------------------------------------
+/* DOP for 3-unknown position-only solver (clock pre-corrected, not estimated).
+   Returns dop[0]=0 (no GDOP), dop[1]=PDOP3, dop[2]=HDOP3, dop[3]=VDOP3.
+   The H matrix has 3 columns (ENU: east, north, up) with no clock row, so
+   there is no clock-position coupling. PDOP3 < PDOP (4-unknown) for the
+   same geometry because the clock ambiguity does not inflate position error. */
+static void dops_pos(int ns, const double *azel, double elmin, double *dop)
+{
+    double H[MAXOBS * 3], A[9] = {0};
+    int i, r, c, n = 0;
+
+    dop[0] = dop[1] = dop[2] = dop[3] = 0.0;
+    for (i = 0; i < ns; i++) {
+        if (azel[1 + i*2] < elmin) continue;
+        double az = azel[i*2], el = azel[1 + i*2];
+        H[n*3+0] = cos(el)*sin(az);   /* east */
+        H[n*3+1] = cos(el)*cos(az);   /* north */
+        H[n*3+2] = sin(el);           /* up */
+        n++;
+    }
+    if (n < 3) return;
+    /* A = H^T H (3×3, column-major: A[r + c*3]) */
+    for (i = 0; i < n; i++)
+        for (r = 0; r < 3; r++)
+            for (c = 0; c < 3; c++)
+                A[r + c*3] += H[i*3+r] * H[i*3+c];
+    if (matinv(A, 3)) return;  /* singular → leave dop zero */
+    /* dop[0]=0: no GDOP (clock not a state); dop[1]=PDOP3, dop[2]=HDOP3, dop[3]=VDOP3 */
+    dop[1] = SQRT(A[0] + A[4] + A[8]); /* trace = east+north+up */
+    dop[2] = SQRT(A[0] + A[4]);        /* horizontal */
+    dop[3] = SQRT(A[8]);               /* vertical */
+}
+
 //  Output log $POS (position solution).
 //
 //  format:
 //      $POS,time,year,month,day,hour,min,sec,lat,lon,hgt,Q,ns,stdn,stde,stdu,
-//        dtr
+//        dtr,x,y,z,vx,vy,vz,gdop,pdop,hdop,vdop
 //          time  receiver time (s)
 //          year,month,day  solution day (GPST)
 //          hour,min,sec  solution time (GPST)
@@ -235,10 +288,15 @@ static void out_log_obs(double time, const obs_t *obs, const nav_t *nav)
 //          dtr   receiver clock bias (s)
 //          x,y,z ECEF position (m)
 //          vx,vy,vz ECEF velocity (m/s, non-zero only in kinematic mode)
+//          gdop  GDOP (0 when clock is pre-corrected — 3-unknown solve)
+//          pdop  PDOP (3-unknown position-only when clock pre-corrected)
+//          hdop  HDOP
+//          vdop  VDOP
 //
-static void out_log_pos(double time, const sol_t *sol, int nsat)
+static void out_log_pos(double time, const sol_t *sol, int nsat,
+                        const ssat_t *ssat)
 {
-    double ep[6], pos[3], P[9], Q[9];
+    double ep[6], pos[3], P[9], Q[9], dop[4] = {0};
     /* In PPP mode, RTKLIB stores sol->dtr[0] = x[IC_GPS] in meters (not seconds).
        Convert to seconds for time display and dtr field output. */
     double dtr_s = (sdr_pmode >= PMODE_PPP_KINEMA) ? sol->dtr[0] / CLIGHT : sol->dtr[0];
@@ -251,13 +309,33 @@ static void out_log_pos(double time, const sol_t *sol, int nsat)
     P[5] = P[7] = sol->qr[4];
     P[2] = P[6] = sol->qr[5];
     covenu(pos, P, Q);
+    if (ssat) {
+        double azels[MAXSAT * 2];
+        int ns = 0;
+        for (int i = 0; i < MAXSAT; i++) {
+            if (ssat[i].azel[1] > 0.0) {
+                azels[ns * 2]     = ssat[i].azel[0];
+                azels[ns * 2 + 1] = ssat[i].azel[1];
+                ns++;
+            }
+        }
+        /* When clock is pre-corrected (SC AOWR mode), the estimation has only 3
+           position unknowns — use position-only DOP (no clock-position coupling).
+           gdop=0 in the log signals "clock-fixed" mode to downstream tools.
+           Otherwise compute standard 4-unknown GDOP/PDOP/HDOP/VDOP. */
+        if (sdr_ps_sc_mode && s_sc_hist_n > 0)
+            dops_pos(ns, azels, 0.0, dop);
+        else
+            dops(ns, azels, 0.0, dop);
+    }
     sdr_log(3, "$POS,%.3f,%.0f,%.0f,%.0f,%.0f,%.0f,%.3f,%.9f,%.9f,%.3f,%d,%d,"
-        "%.3f,%.3f,%.3f,%.9f,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f",
+        "%.3f,%.3f,%.3f,%.9f,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.1f,%.1f,%.1f,%.1f",
         time, ep[0], ep[1], ep[2], ep[3], ep[4], ep[5],
         pos[0] * R2D, pos[1] * R2D, pos[2], sol->stat, sol->ns, SQRT(Q[4]),
         SQRT(Q[0]), SQRT(Q[8]), dtr_s,
         sol->rr[0], sol->rr[1], sol->rr[2],
-        sol->rr[3], sol->rr[4], sol->rr[5]);
+        sol->rr[3], sol->rr[4], sol->rr[5],
+        dop[0], dop[1], dop[2], dop[3]);
 }
 
 //------------------------------------------------------------------------------
@@ -770,6 +848,61 @@ static void write_aowr_gs(double tag_tow, double clock_diff_s)
 #endif
 }
 
+// SC mode: open dt_aowr_gnss.txt for reading (O_RDONLY; file is written by SC AOWR process)
+static void open_aowr_sc(void)
+{
+#ifndef WIN32
+    s_sc_fd = open(sdr_ps_sc_file, O_RDONLY);
+    if (s_sc_fd < 0) {
+        sdr_log(1, "$LOG,0,,0,SC: cannot open %s: %s", sdr_ps_sc_file, strerror(errno));
+        return;
+    }
+    s_sc_map = mmap(NULL, SC_FILE_SIZE, PROT_READ, MAP_SHARED, s_sc_fd, 0);
+    if (s_sc_map == MAP_FAILED) {
+        sdr_log(1, "$LOG,0,,0,SC: mmap failed on %s", sdr_ps_sc_file);
+        s_sc_map = NULL; close(s_sc_fd); s_sc_fd = -1; return;
+    }
+    s_sc_hist_n = 0;
+    sdr_log(3, "$LOG,0,,0,SC mode: reading AOWR clock from %s (hist=%d)",
+        sdr_ps_sc_file, SC_CLOCK_HIST_SIZE);
+#endif
+}
+
+static void close_aowr_sc(void)
+{
+#ifndef WIN32
+    if (s_sc_map && s_sc_map != MAP_FAILED) {
+        munmap(s_sc_map, SC_FILE_SIZE); s_sc_map = NULL;
+    }
+    if (s_sc_fd >= 0) { close(s_sc_fd); s_sc_fd = -1; }
+#endif
+}
+
+// Seqlock read — mirrors read_hybrid_shared_data() in rtklib_pvt_gs.cc.
+// Returns 1 with new data, 0 if write in progress or no new slot since last call.
+static int read_aowr_sc(double *tag_tow, double *clock_diff_s, double *range_m)
+{
+#ifndef WIN32
+    if (!s_sc_map) return 0;
+    aowr_gs_shared_t *p = (aowr_gs_shared_t *)s_sc_map;
+    static uint64_t last_seq = 0;
+    uint64_t seq_before = p->seq;
+    __sync_synchronize();
+    aowr_gs_shared_t snap = *p;
+    __sync_synchronize();
+    uint64_t seq_after = p->seq;
+    if (seq_before != seq_after) return 0;    // write in progress: odd seq
+    if (seq_after == 0 || seq_after == last_seq) return 0;  // uninitialized or stale
+    last_seq      = seq_after;
+    *tag_tow      = snap.tag_tow;
+    *clock_diff_s = snap.clock_diff_s;
+    *range_m      = snap.range_m;
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 //------------------------------------------------------------------------------
 //  Generate a new SDR PVT.
 //
@@ -819,12 +952,18 @@ sdr_pvt_t *sdr_pvt_new(sdr_rcv_t *rcv)
         }
         pvt->rtk = (rtk_t *)sdr_malloc(sizeof(rtk_t));
         rtkinit(pvt->rtk, &opt);
+        /* Reference PPP solver for SC AOWR evaluation (same opts, independent KF state) */
+        if (sdr_ps_sc_mode) {
+            s_sc_ref_rtk = (rtk_t *)sdr_malloc(sizeof(rtk_t));
+            rtkinit(s_sc_ref_rtk, &opt);
+        }
     }
     set_obs_idx(rcv);
     pvt->rcv = rcv;
     sdr_mutex_init(&pvt->mtx);
     load_navdata(FILE_NAV, pvt->nav, pvt); // load nav + almanac + last fix
     if (sdr_ps_gs_mode) open_aowr_gs();
+    if (sdr_ps_sc_mode) open_aowr_sc();
     return pvt;
 }
 
@@ -862,6 +1001,7 @@ void sdr_pvt_loadnav(sdr_pvt_t *pvt, const char *file)
         int ne_loaded = pvt->nav->ne - ne_before;
         if (ne_loaded > 0) {
             if (pvt->rtk) pvt->rtk->opt.sateph = EPHOPT_PREC;
+            if (s_sc_ref_rtk) s_sc_ref_rtk->opt.sateph = EPHOPT_PREC;
             sdr_log(3, "$LOG,0.000,SP3 LOADED: %s (%d orbit epochs, sateph=PREC)",
                 file, ne_loaded);
         } else {
@@ -891,6 +1031,7 @@ void sdr_pvt_free(sdr_pvt_t *pvt)
 {
     if (!pvt) return;
     close_aowr_gs();
+    close_aowr_sc();
     save_navdata(FILE_NAV, pvt->nav, pvt); // save nav + almanac + last fix
     sdr_free(pvt->obs->data);
     sdr_free(pvt->obs);
@@ -905,6 +1046,11 @@ void sdr_pvt_free(sdr_pvt_t *pvt)
     if (pvt->rtk) {
         rtkfree(pvt->rtk);
         sdr_free(pvt->rtk);
+    }
+    if (s_sc_ref_rtk) {
+        rtkfree(s_sc_ref_rtk);
+        sdr_free(s_sc_ref_rtk);
+        s_sc_ref_rtk = NULL;
     }
     sdr_free(pvt);
 }
@@ -1286,7 +1432,7 @@ static void output_sol(sdr_pvt_t *pvt, double time)
     pvt->last_dtr   = pvt->sol->dtr[0];
     pvt->last_dtrd  = pvt->sol->dtr[5];
     pvt->last_valid = 1;
-    out_log_pos(time, pvt->sol, pvt->obs->n);
+    out_log_pos(time, pvt->sol, pvt->obs->n, pvt->ssat);
     out_nmea(pvt->sol, pvt->ssat, pvt->rcv->strs[0]);
     pvt->count[0]++;
     for (int i = 0; i < MAXSAT; i++) {
@@ -1394,6 +1540,10 @@ static void update_aowr(double time, gtime_t gtime, double P, double L)
         s_gs_last_dt_aowr = dt_aowr_cp;
         s_gs_ps_ever_obs  = 1;
     }
+    if (sdr_ps_sc_mode && count > 0) {
+        s_sc_last_dt_aowr = dt_aowr_cp;
+        s_sc_ps_ever_obs  = 1;
+    }
 
     double ep[6];
     time2epoch(gtime, ep);
@@ -1409,7 +1559,9 @@ static void update_sol(sdr_pvt_t *pvt)
 {
     double time = pvt->ix * SDR_CYC;
     obsd_t obs[MAXSAT];
+    obsd_t obs_ref[MAXSAT]; /* uncorrected obs for SC reference solver */
     int mask[MAXSAT] = {0}, nobs = 0;
+    int nobs_ref = 0, run_ref_sol = 0;
     char msg[128] = "";
 
     // deduplicate: one entry per satellite (L1+L2 merged in same obsd_t)
@@ -1456,6 +1608,82 @@ static void update_sol(sdr_pvt_t *pvt)
         out_rtcm3_obs(pvt->rtcm, &merged_obs, pvt->rcv->strs[1], pvt->rcv);
         // update_aowr is now called at 20 ms rate from sdr_pvt_udobs()
     }
+
+    // SC mode: extrapolate AOWR clock to current epoch using WLS drift estimation,
+    // then pre-correct obs so pntpos/pppos solve position only (3 unknowns).
+    // Mirrors linear_regression_by_wls + rx_clock_offset_est in rtklib_pvt_gs.cc.
+    if (sdr_ps_sc_mode && s_sc_ps_ever_obs) {
+        // (a) Check for new AOWR data and update clock history
+        double tag_tow, clock_diff_s, range_m;
+        if (read_aowr_sc(&tag_tow, &clock_diff_s, &range_m)) {
+            double new_clock = s_sc_last_dt_aowr + clock_diff_s;
+            double new_tow   = tag_tow + s_sc_last_dt_aowr; /* SC GNSS TOW */
+
+            /* Append to history; shift oldest out when full */
+            if (s_sc_hist_n < SC_CLOCK_HIST_SIZE) {
+                s_sc_tow_hist[s_sc_hist_n] = new_tow;
+                s_sc_clk_hist[s_sc_hist_n] = new_clock;
+                s_sc_hist_n++;
+            } else {
+                memmove(s_sc_tow_hist, s_sc_tow_hist+1,
+                        (SC_CLOCK_HIST_SIZE-1)*sizeof(double));
+                memmove(s_sc_clk_hist, s_sc_clk_hist+1,
+                        (SC_CLOCK_HIST_SIZE-1)*sizeof(double));
+                s_sc_tow_hist[SC_CLOCK_HIST_SIZE-1] = new_tow;
+                s_sc_clk_hist[SC_CLOCK_HIST_SIZE-1] = new_clock;
+            }
+            s_sc_rx_clock = new_clock;
+
+            /* (b) WLS linear regression: y = dt_i + drift*(t - tow_hist[0]) */
+            if (s_sc_hist_n > 1) {
+                double S0=0,S1=0,S2=0,T0=0,T1=0,t0=s_sc_tow_hist[0];
+                for (int k=0; k<s_sc_hist_n; k++) {
+                    double t = s_sc_tow_hist[k] - t0;
+                    double y = s_sc_clk_hist[k];
+                    S0+=1; S1+=t; S2+=t*t; T0+=y; T1+=t*y;
+                }
+                double det = S0*S2 - S1*S1;
+                if (fabs(det) > 1e-12) {
+                    s_sc_dt_i        = (S2*T0 - S1*T1) / det;
+                    s_sc_clock_drift = (-S1*T0 + S0*T1) / det;
+                }
+            } else {
+                s_sc_dt_i        = new_clock;
+                s_sc_clock_drift = 0.0;
+            }
+        }
+
+        /* (c) Extrapolate clock to current epoch and pre-correct obs */
+        if (s_sc_rx_clock != 0.0 && s_sc_hist_n > 0 && nobs > 0) {
+            int wn;
+            double current_tow = time2gpst(obs[0].time, &wn);
+            double clock_est   = s_sc_dt_i +
+                                 s_sc_clock_drift * (current_tow - s_sc_tow_hist[0]);
+
+            sdr_log(3, "$LOG,%.3f,SC_AOWR clk=%.9f drift=%.3e dt=%.3f hist=%d",
+                time, clock_est, s_sc_clock_drift,
+                current_tow - s_sc_tow_hist[0], s_sc_hist_n);
+
+            /* Save uncorrected obs for parallel reference solver */
+            memcpy(obs_ref, obs, sizeof(obsd_t) * nobs);
+            nobs_ref    = nobs;
+            run_ref_sol = 1;
+
+            /* Pre-correct observations with extrapolated clock */
+            for (int i = 0; i < nobs; i++) {
+                obs[i].time = timeadd(obs[i].time, -clock_est);
+                for (int j = 0; j < NFREQ + NEXOBS; j++) {
+                    if (obs[i].P[j] != 0.0)
+                        obs[i].P[j] -= clock_est * CLIGHT;
+                    if (obs[i].L[j] != 0.0) {
+                        double freq = sat2freq(obs[i].sat, obs[i].code[j], pvt->nav);
+                        if (freq > 0.0) obs[i].L[j] -= clock_est * freq;
+                    }
+                }
+            }
+        }
+    }
+
     if (sdr_pmode >= PMODE_PPP_KINEMA) {
         // Set time interval for KF process noise propagation (rtkpos() normally does this)
         gtime_t obs_time = nobs > 0 ? obs[0].time : pvt->time;
@@ -1467,6 +1695,7 @@ static void update_sol(sdr_pvt_t *pvt)
         prcopt_t spopt = prcopt_default;
         spopt.navsys |= SYS_GLO | SYS_GAL | SYS_QZS | SYS_CMP | SYS_IRN;
         spopt.elmin = sdr_el_mask * D2R;
+        if (run_ref_sol) spopt.clock_bias_fixed = 1; /* obs pre-corrected → 3-unknown */
         // Pass pvt->rtk->ssat so pntpos sets ssat[sat].vs=1; pppos needs vs=1 to accept obs
         // In fixed-position mode, seed pntpos from the known position for a better clock estimate.
         if (sdr_pmode == PMODE_PPP_FIXED && norm(sdr_fixpos, 3) > 1.0) {
@@ -1503,6 +1732,85 @@ static void update_sol(sdr_pvt_t *pvt)
 
         // PPP: dual-frequency Kalman filter via pppos()
         pppos(pvt->rtk, obs, nobs, pvt->nav);
+
+        // Reference PPP: normal PPP on uncorrected obs for SC AOWR evaluation.
+        // Independent KF state in s_sc_ref_rtk; result logged as $REFPOS.
+        if (run_ref_sol && s_sc_ref_rtk) {
+            gtime_t rtime = nobs_ref > 0 ? obs_ref[0].time : pvt->time;
+            s_sc_ref_rtk->tt = s_sc_ref_rtk->sol.time.time > 0 ?
+                timediff(rtime, s_sc_ref_rtk->sol.time) : 0.0;
+
+            // Seed reference RTK position from normal SPP on uncorrected obs
+            prcopt_t rspopt = prcopt_default;
+            rspopt.navsys |= SYS_GLO | SYS_GAL | SYS_QZS | SYS_CMP | SYS_IRN;
+            rspopt.elmin = sdr_el_mask * D2R;
+            pntpos(obs_ref, nobs_ref, pvt->nav, &rspopt, &s_sc_ref_rtk->sol,
+                   NULL, s_sc_ref_rtk->ssat, msg);
+
+            // Seed reference clock states when not yet initialized
+            {
+                int np = s_sc_ref_rtk->opt.dynamics ? 9 : 3;
+                for (int i = 0; i < NSYS; i++) {
+                    int ic = np + i;
+                    if (s_sc_ref_rtk->x[ic] == 0.0 &&
+                        s_sc_ref_rtk->sol.dtr[i] != 0.0) {
+                        double dtr = i == 0 ? s_sc_ref_rtk->sol.dtr[0] :
+                            s_sc_ref_rtk->sol.dtr[0] + s_sc_ref_rtk->sol.dtr[i];
+                        s_sc_ref_rtk->x[ic] = CLIGHT * dtr;
+                        s_sc_ref_rtk->P[ic + ic * s_sc_ref_rtk->nx] = 60.0 * 60.0;
+                    }
+                }
+            }
+
+            pppos(s_sc_ref_rtk, obs_ref, nobs_ref, pvt->nav);
+
+            // Dynamics startup fix (same as main PPP)
+            if (s_sc_ref_rtk->opt.dynamics) {
+                double *rP = s_sc_ref_rtk->P;
+                int rnx = s_sc_ref_rtk->nx;
+                double rpstd = rnx > 0 ? sqrt(rP[0]+rP[1+rnx]+rP[2+2*rnx]) : 0.0;
+                if (rpstd > 200.0) {
+                    for (int j = 3; j < 9; j++) {
+                        s_sc_ref_rtk->x[j] = 0.0;
+                        for (int k = 0; k < rnx; k++) {
+                            rP[j+k*rnx] = 0.0; rP[k+j*rnx] = 0.0;
+                        }
+                    }
+                }
+            }
+
+            // Log reference PPP result (DOP from reference ssat — 4-unknown set)
+            const sol_t *rsol = &s_sc_ref_rtk->sol;
+            if (rsol->stat) {
+                double ep[6], pos[3], rP9[9], Q[9], rdop[4] = {0};
+                double rdtr = rsol->dtr[0] / CLIGHT; /* PPP: meters→seconds */
+                time2epoch(timeadd(rsol->time, rdtr), ep);
+                ecef2pos(rsol->rr, pos);
+                rP9[0]=rsol->qr[0]; rP9[4]=rsol->qr[1]; rP9[8]=rsol->qr[2];
+                rP9[1]=rP9[3]=rsol->qr[3];
+                rP9[5]=rP9[7]=rsol->qr[4];
+                rP9[2]=rP9[6]=rsol->qr[5];
+                covenu(pos, rP9, Q);
+                {
+                    double razels[MAXSAT * 2];
+                    int rns = 0;
+                    for (int i = 0; i < MAXSAT; i++) {
+                        if (s_sc_ref_rtk->ssat[i].azel[1] > 0.0) {
+                            razels[rns*2]   = s_sc_ref_rtk->ssat[i].azel[0];
+                            razels[rns*2+1] = s_sc_ref_rtk->ssat[i].azel[1];
+                            rns++;
+                        }
+                    }
+                    dops(rns, razels, 0.0, rdop);
+                }
+                sdr_log(3, "$REFPOS,%.3f,%.0f,%.0f,%.0f,%.0f,%.0f,%.3f,"
+                    "%.9f,%.9f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.9f,%.1f,%.1f,%.1f,%.1f",
+                    time, ep[0],ep[1],ep[2],ep[3],ep[4],ep[5],
+                    pos[0]*R2D, pos[1]*R2D, pos[2], rsol->stat, rsol->ns,
+                    SQRT(Q[4]), SQRT(Q[0]), SQRT(Q[8]), rdtr,
+                    rdop[0], rdop[1], rdop[2], rdop[3]);
+            }
+        }
 
         // Prevent kinematic startup divergence.
         // In IFLC mode, PPP needs 4 dual-freq (L1+L2) satellites. L2CM takes
@@ -1583,6 +1891,7 @@ static void update_sol(sdr_pvt_t *pvt)
         opt.tropopt = TROPOPT_SAAS;
         opt.elmin = sdr_el_mask * D2R;
         opt.posopt[4] = 1; // RAIM-FDE
+        if (run_ref_sol) opt.clock_bias_fixed = 1; /* obs pre-corrected → 3-unknown */
 
         if (pntpos(obs, nobs, pvt->nav, &opt, pvt->sol, NULL, pvt->ssat, msg)) {
             output_sol(pvt, time);
@@ -1593,6 +1902,49 @@ static void update_sol(sdr_pvt_t *pvt)
         }
     }
     pvt->nsat = pvt->obs->n;
+
+    // SC reference solver: normal 4-unknown SPP on uncorrected obs for AOWR evaluation.
+    // PPP mode uses its own reference pppos() above; this handles SPP mode only.
+    if (run_ref_sol && sdr_pmode < PMODE_PPP_KINEMA) {
+        prcopt_t ref_opt = prcopt_default;
+        ref_opt.navsys |= SYS_GLO | SYS_GAL | SYS_QZS | SYS_CMP | SYS_IRN;
+        ref_opt.err[1] = ref_opt.err[2] = STD_ERR;
+        ref_opt.ionoopt = sdr_ionoopt;
+        ref_opt.tropopt = TROPOPT_SAAS;
+        ref_opt.elmin   = sdr_el_mask * D2R;
+        ref_opt.posopt[4] = 1; /* RAIM-FDE */
+        sol_t ref_sol = {0};
+        double ref_azel[MAXSAT * 2] = {0}; /* azel from 4-unknown solve for DOP */
+        if (pntpos(obs_ref, nobs_ref, pvt->nav, &ref_opt, &ref_sol,
+                   ref_azel, NULL, msg)) {
+            double ep[6], pos[3], P[9], Q[9], rdop[4] = {0};
+            double dtr_s = ref_sol.dtr[0];
+            time2epoch(timeadd(ref_sol.time, dtr_s), ep);
+            ecef2pos(ref_sol.rr, pos);
+            P[0]=ref_sol.qr[0]; P[4]=ref_sol.qr[1]; P[8]=ref_sol.qr[2];
+            P[1]=P[3]=ref_sol.qr[3]; P[5]=P[7]=ref_sol.qr[4]; P[2]=P[6]=ref_sol.qr[5];
+            covenu(pos, P, Q);
+            /* DOP from 4-unknown reference solve (independent of main clock-fixed DOP) */
+            {
+                double razels[MAXSAT * 2];
+                int rns = 0;
+                for (int i = 0; i < nobs_ref; i++) {
+                    if (ref_azel[2*i+1] > ref_opt.elmin) {
+                        razels[rns*2]   = ref_azel[2*i];
+                        razels[rns*2+1] = ref_azel[2*i+1];
+                        rns++;
+                    }
+                }
+                dops(rns, razels, ref_opt.elmin, rdop);
+            }
+            sdr_log(3, "$REFPOS,%.3f,%.0f,%.0f,%.0f,%.0f,%.0f,%.3f,"
+                "%.9f,%.9f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.9f,%.1f,%.1f,%.1f,%.1f",
+                time, ep[0],ep[1],ep[2],ep[3],ep[4],ep[5],
+                pos[0]*R2D, pos[1]*R2D, pos[2], ref_sol.stat, ref_sol.ns,
+                SQRT(Q[4]), SQRT(Q[0]), SQRT(Q[8]), dtr_s,
+                rdop[0], rdop[1], rdop[2], rdop[3]);
+        }
+    }
 
     // for debug
     double pos[3];

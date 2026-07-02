@@ -346,18 +346,18 @@ static int valsol(const double *azel, const int *vsat, int n,
                   const prcopt_t *opt, const double *v, int nv, int nx,
                   char *msg)
 {
-    double azels[MAXOBS*2],dop[4],vv;
+    double azels[MAXOBS*2],dop[4],vv,dopcheck;
     int i,ns;
-    
+
     trace(3,"valsol  : n=%d nv=%d\n",n,nv);
-    
+
     /* Chi-square validation of residuals */
     vv=dot(v,v,nv);
     if (nv>nx&&vv>chisqr[nv-nx-1]) {
         sprintf(msg,"chi-square error nv=%d vv=%.1f cs=%.1f",nv,vv,chisqr[nv-nx-1]);
         return 0;
     }
-    /* large GDOP check */
+    /* large DOP check: PDOP when clock fixed (3-unknown), GDOP otherwise */
     for (i=ns=0;i<n;i++) {
         if (!vsat[i]) continue;
         azels[  ns*2]=azel[  i*2];
@@ -365,8 +365,9 @@ static int valsol(const double *azel, const int *vsat, int n,
         ns++;
     }
     dops(ns,azels,opt->elmin,dop);
-    if (dop[0]<=0.0||dop[0]>opt->maxgdop) {
-        sprintf(msg,"gdop error nv=%d gdop=%.1f",nv,dop[0]);
+    dopcheck=(nx<NX)?dop[1]:dop[0];
+    if (dopcheck<=0.0||dopcheck>opt->maxgdop) {
+        sprintf(msg,"gdop error nv=%d gdop=%.1f",nv,dopcheck);
         return 0;
     }
     return 1;
@@ -378,21 +379,24 @@ static int estpos(const obsd_t *obs, int n, const double *rs, const double *dts,
                   double *resp, char *msg)
 {
     double x[NX]={0},dx[NX],Q[NX*NX],*v,*H,*var,sig;
-    int i,j,k,info,stat,nv,ns;
-    
+    int i,j,k,info,stat,nv,ns,nx;
+
     trace(3,"estpos  : n=%d\n",n);
-    
+
+    /* nx=3 when clock is externally known (SC AOWR mode): solve position only */
+    nx=opt->clock_bias_fixed?3:NX;
+
     v=mat(n+4,1); H=mat(NX,n+4); var=mat(n+4,1);
-    
+
     for (i=0;i<3;i++) x[i]=sol->rr[i];
-    
+
     for (i=0;i<MAXITR;i++) {
-        
+
         /* pseudorange residuals (m) */
         nv=rescode(i,obs,n,rs,dts,vare,svh,nav,x,opt,v,H,var,azel,vsat,resp,
                    &ns);
-        
-        if (nv<NX) {
+
+        if (nv<nx) {
             sprintf(msg,"lack of valid sats ns=%d",nv);
             break;
         }
@@ -402,40 +406,71 @@ static int estpos(const obsd_t *obs, int n, const double *rs, const double *dts,
             v[j]/=sig;
             for (k=0;k<NX;k++) H[k+j*NX]/=sig;
         }
-        /* least square estimation */
-        if ((info=lsq(H,v,NX,nv,dx,Q))) {
-            sprintf(msg,"lsq error info=%d",info);
-            break;
-        }
-        for (j=0;j<NX;j++) {
-            x[j]+=dx[j];
-        }
-        if (norm(dx,NX)<1E-4) {
-            sol->type=0;
-            sol->time=timeadd(obs[0].time,-x[3]/CLIGHT);
-            sol->dtr[0]=x[3]/CLIGHT; /* receiver clock bias (s) */
-            sol->dtr[1]=x[4]/CLIGHT; /* GLO-GPS time offset (s) */
-            sol->dtr[2]=x[5]/CLIGHT; /* GAL-GPS time offset (s) */
-            sol->dtr[3]=x[6]/CLIGHT; /* BDS-GPS time offset (s) */
-            sol->dtr[4]=x[7]/CLIGHT; /* IRN-GPS time offset (s) */
-            for (j=0;j<6;j++) sol->rr[j]=j<3?x[j]:0.0;
-            for (j=0;j<3;j++) sol->qr[j]=(float)Q[j+j*NX];
-            sol->qr[3]=(float)Q[1];    /* cov xy */
-            sol->qr[4]=(float)Q[2+NX]; /* cov yz */
-            sol->qr[5]=(float)Q[2];    /* cov zx */
-            sol->ns=(uint8_t)ns;
-            sol->age=sol->ratio=0.0;
-            
-            /* validate solution */
-            if ((stat=valsol(azel,vsat,n,opt,v,nv,NX,msg))) {
-                sol->stat=opt->sateph==EPHOPT_SBAS?SOLQ_SBAS:SOLQ_SINGLE;
+        if (opt->clock_bias_fixed) {
+            /* 3-unknown LSQ: extract position rows (H stride NX→nx) */
+            double *Hc=mat(nx,nv),*Qc=mat(nx,nx),*dxc=mat(nx,1);
+            for (j=0;j<nv;j++) for (k=0;k<nx;k++) Hc[k+j*nx]=H[k+j*NX];
+            info=lsq(Hc,v,nx,nv,dxc,Qc);
+            if (!info) {
+                for (j=0;j<nx;j++) { x[j]+=dxc[j]; dx[j]=dxc[j]; }
+                if (norm(dxc,nx)<1E-4) {
+                    sol->type=0;
+                    /* obs time already AOWR-corrected; x[3]=0, no adjustment needed */
+                    sol->time=obs[0].time;
+                    /* dtr: not updated — clock is externally fixed */
+                    for (j=0;j<6;j++) sol->rr[j]=j<3?x[j]:0.0;
+                    for (j=0;j<3;j++) sol->qr[j]=(float)Qc[j+j*nx];
+                    sol->qr[3]=(float)Qc[1];
+                    sol->qr[4]=(float)Qc[2+nx];
+                    sol->qr[5]=(float)Qc[2];
+                    sol->ns=(uint8_t)ns;
+                    sol->age=sol->ratio=0.0;
+                    if ((stat=valsol(azel,vsat,n,opt,v,nv,nx,msg)))
+                        sol->stat=opt->sateph==EPHOPT_SBAS?SOLQ_SBAS:SOLQ_SINGLE;
+                    free(Hc); free(Qc); free(dxc);
+                    free(v); free(H); free(var);
+                    return stat;
+                }
             }
-            free(v); free(H); free(var);
-            return stat;
+            else sprintf(msg,"lsq error info=%d",info);
+            free(Hc); free(Qc); free(dxc);
+            if (info) break;
+        }
+        else {
+            /* least square estimation */
+            if ((info=lsq(H,v,NX,nv,dx,Q))) {
+                sprintf(msg,"lsq error info=%d",info);
+                break;
+            }
+            for (j=0;j<NX;j++) {
+                x[j]+=dx[j];
+            }
+            if (norm(dx,NX)<1E-4) {
+                sol->type=0;
+                sol->time=timeadd(obs[0].time,-x[3]/CLIGHT);
+                sol->dtr[0]=x[3]/CLIGHT; /* receiver clock bias (s) */
+                sol->dtr[1]=x[4]/CLIGHT; /* GLO-GPS time offset (s) */
+                sol->dtr[2]=x[5]/CLIGHT; /* GAL-GPS time offset (s) */
+                sol->dtr[3]=x[6]/CLIGHT; /* BDS-GPS time offset (s) */
+                sol->dtr[4]=x[7]/CLIGHT; /* IRN-GPS time offset (s) */
+                for (j=0;j<6;j++) sol->rr[j]=j<3?x[j]:0.0;
+                for (j=0;j<3;j++) sol->qr[j]=(float)Q[j+j*NX];
+                sol->qr[3]=(float)Q[1];    /* cov xy */
+                sol->qr[4]=(float)Q[2+NX]; /* cov yz */
+                sol->qr[5]=(float)Q[2];    /* cov zx */
+                sol->ns=(uint8_t)ns;
+                sol->age=sol->ratio=0.0;
+                /* validate solution */
+                if ((stat=valsol(azel,vsat,n,opt,v,nv,NX,msg))) {
+                    sol->stat=opt->sateph==EPHOPT_SBAS?SOLQ_SBAS:SOLQ_SINGLE;
+                }
+                free(v); free(H); free(var);
+                return stat;
+            }
         }
     }
     if (i>=MAXITR) sprintf(msg,"iteration divergent i=%d",i);
-    
+
     free(v); free(H); free(var);
     return 0;
 }

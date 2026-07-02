@@ -1042,6 +1042,7 @@ typedef struct {        /* processing options type */
     double odisp[2][6*11]; /* ocean tide loading parameters {rov,base} */
     int  freqopt;       /* disable L2-AR */
     char pppopt[256];   /* ppp option */
+    int  clock_bias_fixed; /* fix receiver clock to known value (SC AOWR mode) */
 } prcopt_t;
 
 typedef struct {        /* solution options type */

@@ -1932,6 +1932,7 @@ void sdr_rcv_setopt(const char *opt, double value)
     extern int sdr_ps_prn;
     extern double sdr_ps_dist, sdr_ps_freq_err;
     extern int sdr_ps_gs_mode;
+    extern int sdr_ps_sc_mode;
     if      (!strcmp(opt, "epoch"      )) sdr_epoch       = value;
     else if (!strcmp(opt, "lag_epoch"  )) sdr_lag_epoch   = value;
     else if (!strcmp(opt, "el_mask"    )) sdr_el_mask     = value;
@@ -1963,5 +1964,6 @@ void sdr_rcv_setopt(const char *opt, double value)
     else if (!strcmp(opt, "ps_dist"     )) sdr_ps_dist      = value;
     else if (!strcmp(opt, "ps_freq_err" )) sdr_ps_freq_err  = value;
     else if (!strcmp(opt, "ps_gs_mode"  )) sdr_ps_gs_mode   = (int)value;
+    else if (!strcmp(opt, "ps_sc_mode"  )) sdr_ps_sc_mode   = (int)value;
     else fprintf(stderr, "sdr_rcv_setopt error opt=%s\n", opt);
 }

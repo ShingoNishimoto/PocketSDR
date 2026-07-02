@@ -2,19 +2,24 @@
 #
 #  pocket_export.py - Export PocketSDR pocket.log to geo/data formats.
 #
-#  Reads $POS entries and writes any combination of:
-#    KML     (-  Google Earth, PPP and SPP as separate folders)
-#    GPX     (- GPS track format, PPP and SPP as separate tracks)
-#    GeoJSON (- web mapping, per-point properties)
-#    CSV     (- spreadsheet-compatible)
-#    Excel   (- .xlsx with All / PPP / SPP sheets)
+#  Reads $POS (and optionally $REFPOS) entries and writes any combination of:
+#    KML     (Google Earth, PPP and SPP as separate folders)
+#    GPX     (GPS track format, PPP and SPP as separate tracks)
+#    GeoJSON (web mapping, per-point properties)
+#    CSV     (spreadsheet-compatible)
+#    Excel   (.xlsx with All / PPP / SPP sheets; Ref / RefPPP / RefSPP added when
+#             $REFPOS records are present)
 #
 #  Usage:
 #    python3 pocket_export.py pocket.log [--all] [--kml F] [--gpx F]
 #                             [--geojson F] [--csv F] [--excel F]
+#                             [--ref-kml F] [--ref-gpx F] [--ref-geojson F]
+#                             [--ref-csv F] [--ref-excel F]
 #
 #  With --all, all formats are written; file names are derived from the log
 #  file base name (e.g. pocket.log → pocket.kml, pocket.gpx, ...).
+#  Reference solution files are written automatically when $REFPOS records
+#  exist (pocket_ref.kml, pocket_ref.csv, …).
 #
 import sys, argparse, json, os
 from datetime import datetime, timezone, timedelta
@@ -36,10 +41,10 @@ GPS_LEAP_SECONDS = 18
 def parse_log(path):
     """Return list of dicts parsed from $POS lines in a pocket.log file.
 
-    $POS format (fields 17-22 added in newer builds):
-      t,year,month,day,hour,min,sec,lat,lon,hgt,q,ns,stdn,stde,stdu,dtr,
-      ecef_x,ecef_y,ecef_z,vel_x,vel_y,vel_z
-    Older logs with only 17 fields fall back to computed ECEF and zero velocity.
+    $POS format:
+      t,year,month,day,hour,min,sec,lat,lon,hgt,q,ns,stdn,stde,stdu,dtr [17 fields]
+      + ecef_x,ecef_y,ecef_z,vel_x,vel_y,vel_z                          [+6, len>=23]
+      + gdop,pdop,hdop,vdop                                              [+4, len>=27]
     """
     rows = []
     with open(path, errors='replace') as f:
@@ -63,7 +68,6 @@ def parse_log(path):
                     'stdu':  float(p[15]), 'dtr':  float(p[16]),
                 }
                 if len(p) >= 23:
-                    # New format: ECEF position and velocity from RTKLIB
                     r['ecef_x'] = float(p[17])
                     r['ecef_y'] = float(p[18])
                     r['ecef_z'] = float(p[19])
@@ -71,17 +75,61 @@ def parse_log(path):
                     r['vel_y']  = float(p[21])
                     r['vel_z']  = float(p[22])
                 else:
-                    # Old format: derive ECEF from lat/lon/hgt, velocity unknown
                     r['ecef_x'], r['ecef_y'], r['ecef_z'] = \
                         llh_to_ecef(r['lat'], r['lon'], r['hgt'])
                     r['vel_x'] = r['vel_y'] = r['vel_z'] = float('nan')
+                if len(p) >= 27:
+                    r['gdop'] = float(p[23])
+                    r['pdop'] = float(p[24])
+                    r['hdop'] = float(p[25])
+                    r['vdop'] = float(p[26])
                 rows.append(r)
             except (ValueError, IndexError):
                 continue
     return rows
 
+
+def parse_refpos_log(path):
+    """Return list of dicts parsed from $REFPOS lines (reference/uncorrected solver).
+
+    $REFPOS format (4-unknown solve, clock estimated, no ECEF/velocity):
+      t,year,month,day,hour,min,sec,lat,lon,hgt,stat,ns,stdn,stde,stdu,dtr [17 fields]
+      + gdop,pdop,hdop,vdop                                                 [+4, len>=21]
+    """
+    rows = []
+    with open(path, errors='replace') as f:
+        for line in f:
+            line = line.strip()
+            if not line.startswith('$REFPOS,'):
+                continue
+            p = line.split(',')
+            if len(p) < 17:
+                continue
+            try:
+                r = {
+                    't':     float(p[1]),
+                    'year':  int(float(p[2])), 'month': int(float(p[3])),
+                    'day':   int(float(p[4])), 'hour':  int(float(p[5])),
+                    'min':   int(float(p[6])), 'sec':   float(p[7]),
+                    'lat':   float(p[8]),  'lon':  float(p[9]),
+                    'hgt':   float(p[10]),
+                    'q':     int(p[11]),   'ns':   int(p[12]),
+                    'stdn':  float(p[13]), 'stde': float(p[14]),
+                    'stdu':  float(p[15]), 'dtr':  float(p[16]),
+                }
+                if len(p) >= 21:
+                    r['gdop'] = float(p[17])
+                    r['pdop'] = float(p[18])
+                    r['hdop'] = float(p[19])
+                    r['vdop'] = float(p[20])
+                rows.append(r)
+            except (ValueError, IndexError):
+                continue
+    return rows
+
+
 def gpst_to_utc(r):
-    """Convert $POS epoch fields (GPST) to UTC datetime object."""
+    """Convert $POS/$REFPOS epoch fields (GPST) to UTC datetime object."""
     si = int(r['sec'])
     us = int((r['sec'] - si) * 1e6)
     # time2epoch() can return sec=60.000 at a minute boundary due to float rounding
@@ -91,7 +139,6 @@ def gpst_to_utc(r):
     return dt + timedelta(minutes=extra_min) - timedelta(seconds=GPS_LEAP_SECONDS)
 
 def gpst_str(r):
-    # Use gpst_to_utc then add back leap seconds — handles sec=60 rollover cleanly
     dt = gpst_to_utc(r) + timedelta(seconds=GPS_LEAP_SECONDS)
     frac = r['sec'] % 1
     return (f"{dt.year}-{dt.month:02d}-{dt.day:02d}"
@@ -110,9 +157,10 @@ def llh_to_ecef(lat_deg, lon_deg, hgt_m):
 
 # ── KML ───────────────────────────────────────────────────────────────────────
 
-def write_kml(rows, path):
+def write_kml(rows, path, label=''):
     ppp = [r for r in rows if r['q'] == 6]
     spp = [r for r in rows if r['q'] != 6]
+    tag = f' ({label})' if label else ''
 
     def track(pts, name, line_style, dot_style):
         coords = ' '.join(f"{r['lon']},{r['lat']},{r['hgt']}" for r in pts)
@@ -139,7 +187,7 @@ def write_kml(rows, path):
     kml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2">
 <Document>
-  <name>PocketSDR Position</name>
+  <name>PocketSDR Position{tag}</name>
   <Style id="pppLine"><LineStyle><color>ff0000ff</color><width>2</width></LineStyle></Style>
   <Style id="pppDot"><IconStyle><color>ff0000ff</color><scale>0.5</scale></IconStyle>
                     <LabelStyle><scale>0</scale></LabelStyle></Style>
@@ -158,11 +206,12 @@ def write_kml(rows, path):
 </kml>'''
     with open(path, 'w') as f:
         f.write(kml)
-    print(f'KML:     {path}  ({len(ppp)} PPP + {len(spp)} SPP)')
+    kind = f'KML{tag}:'
+    print(f'{kind:<16} {path}  ({len(ppp)} PPP + {len(spp)} SPP)')
 
 # ── GPX ───────────────────────────────────────────────────────────────────────
 
-def write_gpx(rows, path):
+def write_gpx(rows, path, label=''):
     def trkpt(r):
         dt = gpst_to_utc(r)
         ts = dt.strftime('%Y-%m-%dT%H:%M:%S.') + f'{dt.microsecond//1000:03d}Z'
@@ -176,18 +225,19 @@ def write_gpx(rows, path):
     spp_pts = '\n'.join(trkpt(r) for r in rows if r['q'] != 6)
     ppp_n = sum(1 for r in rows if r['q'] == 6)
     spp_n = len(rows) - ppp_n
+    tag = f' ({label})' if label else ''
 
     gpx = f'''<?xml version="1.0" encoding="UTF-8"?>
 <gpx version="1.1" creator="PocketSDR pocket_export.py"
      xmlns="http://www.topografix.com/GPX/1/1">
   <trk>
-    <name>PPP (Q=6)</name>
+    <name>PPP (Q=6){tag}</name>
     <trkseg>
 {ppp_pts}
     </trkseg>
   </trk>
   <trk>
-    <name>SPP (Q=5)</name>
+    <name>SPP (Q=5){tag}</name>
     <trkseg>
 {spp_pts}
     </trkseg>
@@ -195,11 +245,13 @@ def write_gpx(rows, path):
 </gpx>'''
     with open(path, 'w') as f:
         f.write(gpx)
-    print(f'GPX:     {path}  ({ppp_n} PPP + {spp_n} SPP)')
+    kind = f'GPX{tag}:'
+    print(f'{kind:<16} {path}  ({ppp_n} PPP + {spp_n} SPP)')
 
 # ── GeoJSON ───────────────────────────────────────────────────────────────────
 
-def write_geojson(rows, path):
+def write_geojson(rows, path, label=''):
+    source = label or 'main'
     features = [{
         'type': 'Feature',
         'geometry': {
@@ -208,25 +260,33 @@ def write_geojson(rows, path):
                             round(r['hgt'], 3)],
         },
         'properties': {
-            't_s': r['t'],
-            'datetime_gpst': gpst_str(r),
-            'quality': r['q'],
-            'quality_label': SOLQ_LABEL.get(r['q'], str(r['q'])),
-            'n_sats': r['ns'],
-            'stdn_m': round(r['stdn'], 4),
-            'stde_m': round(r['stde'], 4),
-            'stdu_m': round(r['stdu'], 4),
-            'dtr_s':  round(r['dtr'], 9),
+            'source':         source,
+            't_s':            r['t'],
+            'datetime_gpst':  gpst_str(r),
+            'quality':        r['q'],
+            'quality_label':  SOLQ_LABEL.get(r['q'], str(r['q'])),
+            'n_sats':         r['ns'],
+            'stdn_m':         round(r['stdn'], 4),
+            'stde_m':         round(r['stde'], 4),
+            'stdu_m':         round(r['stdu'], 4),
+            'dtr_s':          round(r['dtr'], 9),
         },
     } for r in rows]
     fc = {'type': 'FeatureCollection', 'features': features}
     with open(path, 'w') as f:
         json.dump(fc, f, separators=(',', ':'))
-    print(f'GeoJSON: {path}  ({len(features)} features)')
+    tag = f' ({label})' if label else ''
+    kind = f'GeoJSON{tag}:'
+    print(f'{kind:<16} {path}  ({len(features)} features)')
 
 # ── CSV / Excel ───────────────────────────────────────────────────────────────
 
 def make_df(rows):
+    """Build a DataFrame from $POS or $REFPOS row dicts.
+
+    Optional fields (ecef, velocity, DOP) use .get() so the same function
+    works for both row types; missing values become NaN.
+    """
     return pd.DataFrame([{
         't_s':           r['t'],
         'datetime_gpst': gpst_str(r),
@@ -234,14 +294,14 @@ def make_df(rows):
         'lat_deg':       r['lat'],
         'lon_deg':       r['lon'],
         'hgt_m':         r['hgt'],
-        # ECEF position (converted from lat/lon/hgt via WGS84)
-        'ecef_x_m':      r['ecef_x'],
-        'ecef_y_m':      r['ecef_y'],
-        'ecef_z_m':      r['ecef_z'],
-        # ECEF velocity (numerical derivative; meaningful only for kinematic mode)
-        'vel_x_m_s':     r['vel_x'],
-        'vel_y_m_s':     r['vel_y'],
-        'vel_z_m_s':     r['vel_z'],
+        # ECEF position (NaN for $REFPOS rows which don't carry ECEF)
+        'ecef_x_m':      r.get('ecef_x', float('nan')),
+        'ecef_y_m':      r.get('ecef_y', float('nan')),
+        'ecef_z_m':      r.get('ecef_z', float('nan')),
+        # ECEF velocity (non-zero only in kinematic PPP; NaN for $REFPOS)
+        'vel_x_m_s':     r.get('vel_x', float('nan')),
+        'vel_y_m_s':     r.get('vel_y', float('nan')),
+        'vel_z_m_s':     r.get('vel_z', float('nan')),
         # Solution quality
         'quality':       r['q'],
         'quality_label': SOLQ_LABEL.get(r['q'], str(r['q'])),
@@ -250,14 +310,23 @@ def make_df(rows):
         'stde_m':        r['stde'],
         'stdu_m':        r['stdu'],
         'dtr_s':         r['dtr'],
+        # DOP (NaN for old logs without DOP fields)
+        # For $POS (clock-corrected): gdop=0, pdop=PDOP3 (position-only, no clock coupling)
+        # For $REFPOS (4-unknown):    gdop=GDOP, pdop=PDOP with clock-position coupling
+        'gdop':          r.get('gdop', float('nan')),
+        'pdop':          r.get('pdop', float('nan')),
+        'hdop':          r.get('hdop', float('nan')),
+        'vdop':          r.get('vdop', float('nan')),
     } for r in rows])
 
-def write_csv(rows, path):
+def write_csv(rows, path, label=''):
     df = make_df(rows)
     df.to_csv(path, index=False, float_format='%.9g')
-    print(f'CSV:     {path}  ({len(df)} rows)')
+    tag = f' ({label})' if label else ''
+    kind = f'CSV{tag}:'
+    print(f'{kind:<16} {path}  ({len(df)} rows)')
 
-def write_excel(rows, path):
+def write_excel(rows, path, ref_rows=None):
     df = make_df(rows)
     ppp_df = df[df['quality'] == 6]
     spp_df = df[df['quality'] != 6]
@@ -265,21 +334,37 @@ def write_excel(rows, path):
         df.to_excel(xw, sheet_name='All', index=False)
         ppp_df.to_excel(xw, sheet_name='PPP', index=False)
         spp_df.to_excel(xw, sheet_name='SPP', index=False)
-    print(f'Excel:   {path}  ({len(df)} rows: {len(ppp_df)} PPP, {len(spp_df)} SPP)')
+        if ref_rows:
+            rdf = make_df(ref_rows)
+            rppp = rdf[rdf['quality'] == 6]
+            rspp = rdf[rdf['quality'] != 6]
+            rdf.to_excel(xw, sheet_name='Ref', index=False)
+            rppp.to_excel(xw, sheet_name='RefPPP', index=False)
+            rspp.to_excel(xw, sheet_name='RefSPP', index=False)
+    ref_note = f' + {len(ref_rows)} ref' if ref_rows else ''
+    print(f'Excel:           {path}  ({len(df)} rows{ref_note})')
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser(
-        description='Export PocketSDR log to KML / GPX / GeoJSON / CSV / Excel')
+        description='Export PocketSDR log to KML / GPX / GeoJSON / CSV / Excel.\n'
+                    '$REFPOS records (SC AOWR reference solver) are exported '
+                    'automatically with --all, or via --ref-* flags.')
     ap.add_argument('logfile', help='pocket.log file')
     ap.add_argument('--all', action='store_true',
                     help='write all formats; names derived from logfile stem')
+    # Main ($POS) output
     ap.add_argument('--kml',     metavar='FILE')
     ap.add_argument('--gpx',     metavar='FILE')
     ap.add_argument('--geojson', metavar='FILE')
     ap.add_argument('--csv',     metavar='FILE')
     ap.add_argument('--excel',   metavar='FILE')
+    # Reference ($REFPOS) output
+    ap.add_argument('--ref-kml',     metavar='FILE')
+    ap.add_argument('--ref-gpx',     metavar='FILE')
+    ap.add_argument('--ref-geojson', metavar='FILE')
+    ap.add_argument('--ref-csv',     metavar='FILE')
     args = ap.parse_args()
 
     rows = parse_log(args.logfile)
@@ -292,13 +377,23 @@ def main():
     print(f'Parsed {len(rows)} $POS records from {args.logfile}'
           f'  ({ppp_n} PPP, {spp_n} SPP)')
 
-    stem = os.path.splitext(args.logfile)[0]
+    ref_rows = parse_refpos_log(args.logfile)
+    if ref_rows:
+        rppp_n = sum(1 for r in ref_rows if r['q'] == 6)
+        rspp_n = len(ref_rows) - rppp_n
+        print(f'Parsed {len(ref_rows)} $REFPOS records'
+              f'  ({rppp_n} PPP, {rspp_n} SPP)')
 
-    want = args.all or any([args.kml, args.gpx, args.geojson, args.csv, args.excel])
+    stem = os.path.splitext(args.logfile)[0]
+    ref_stem = stem + '_ref'
+
+    want = args.all or any([args.kml, args.gpx, args.geojson, args.csv, args.excel,
+                            args.ref_kml, args.ref_gpx, args.ref_geojson, args.ref_csv])
     if not want:
         ap.print_help()
         sys.exit(0)
 
+    # ── main ($POS) output ──
     if args.all or args.kml:
         write_kml(rows,     args.kml     or stem + '.kml')
     if args.all or args.gpx:
@@ -308,7 +403,27 @@ def main():
     if args.all or args.csv:
         write_csv(rows,     args.csv     or stem + '.csv')
     if args.all or args.excel:
-        write_excel(rows,   args.excel   or stem + '.xlsx')
+        # Include ref sheets in the same Excel file for easy comparison
+        write_excel(rows,   args.excel   or stem + '.xlsx',
+                    ref_rows=ref_rows or None)
+
+    # ── reference ($REFPOS) output ──
+    if ref_rows:
+        if args.all or args.ref_kml:
+            write_kml(ref_rows,     args.ref_kml     or ref_stem + '.kml',
+                      label='ref')
+        if args.all or args.ref_gpx:
+            write_gpx(ref_rows,     args.ref_gpx     or ref_stem + '.gpx',
+                      label='ref')
+        if args.all or args.ref_geojson:
+            write_geojson(ref_rows, args.ref_geojson or ref_stem + '.geojson',
+                          label='ref')
+        if args.all or args.ref_csv:
+            write_csv(ref_rows,     args.ref_csv     or ref_stem + '.csv',
+                      label='ref')
+    elif any([args.ref_kml, args.ref_gpx, args.ref_geojson, args.ref_csv]):
+        print('Warning: no $REFPOS records found — ref output skipped',
+              file=sys.stderr)
 
 if __name__ == '__main__':
     main()
