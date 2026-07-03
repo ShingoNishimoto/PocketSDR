@@ -155,10 +155,12 @@ def parse_spp_seed_log(path, tag):
 def parse_refpos_log(path):
     """Return list of dicts parsed from $REFPOS lines (reference/uncorrected solver).
 
-    $REFPOS format (4-unknown solve, clock estimated, no ECEF/velocity):
+    $REFPOS format (4-unknown solve, clock estimated):
       t,year,month,day,hour,min,sec,lat,lon,hgt,stat,ns,stdn,stde,stdu,dtr [17 fields]
       + gdop,pdop,hdop,vdop                                                 [+4, len>=21]
       + dtr_drift                                                           [+1, len>=22]
+      + vel_x,vel_y,vel_z (ECEF m/s)                                       [+3, len>=25]
+    ECEF position is computed from lat/lon/hgt (not in the log format).
     """
     rows = []
     with open(path, errors='replace') as f:
@@ -181,6 +183,9 @@ def parse_refpos_log(path):
                     'stdn':  float(p[13]), 'stde': float(p[14]),
                     'stdu':  float(p[15]), 'dtr':  float(p[16]),
                 }
+                r['ecef_x'], r['ecef_y'], r['ecef_z'] = \
+                    llh_to_ecef(r['lat'], r['lon'], r['hgt'])
+                r['vel_x'] = r['vel_y'] = r['vel_z'] = float('nan')
                 if len(p) >= 21:
                     r['gdop'] = float(p[17])
                     r['pdop'] = float(p[18])
@@ -188,6 +193,10 @@ def parse_refpos_log(path):
                     r['vdop'] = float(p[20])
                 if len(p) >= 22:
                     r['dtr_drift'] = float(p[21])
+                if len(p) >= 25:
+                    r['vel_x'] = float(p[22])
+                    r['vel_y'] = float(p[23])
+                    r['vel_z'] = float(p[24])
                 rows.append(r)
             except (ValueError, IndexError):
                 continue

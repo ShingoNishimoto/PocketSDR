@@ -79,7 +79,7 @@ char   sdr_ps_sc_file[256] = "./dt_aowr_gnss.txt"; // input file: dt_aowr_gnss.t
 // Layout: 2 slots of aowr_gs_shared_t (64 bytes total); reader uses slot 0 only.
 #define SC_FILE_SIZE       ((int)(sizeof(aowr_gs_shared_t) * 2))  // 64 bytes
 // Clock history for WLS drift estimation (mirrors linear_regression_by_wls in gnss-sdr).
-#define SC_CLOCK_HIST_SIZE 10
+#define SC_CLOCK_HIST_SIZE 5
 
 static int    s_sc_fd          = -1;
 static void  *s_sc_map         = NULL;
@@ -1762,8 +1762,18 @@ static void update_sol(sdr_pvt_t *pvt)
         // (both L1CA and L2CM independently, relative to zero-IF reference).
         // GF/MW/Lc drift are all zero after correction. gf_drift stays 0.
 
-        // PPP: dual-frequency Kalman filter via pppos()
-        pppos(pvt->rtk, obs, nobs, pvt->nav);
+        // PPP: dual-frequency Kalman filter via pppos(), but only when there are
+        // enough dual-frequency observations. With ndual=0 there are no IFLC pairs
+        // and pppos returns immediately, but the EKF position state was already
+        // propagated forward with process noise → diverges. Skip entirely.
+        {
+            int ndual_pre = 0;
+            for (int i = 0; i < nobs; i++) {
+                if (obs[i].code[1] && obs[i].P[1] != 0.0 && obs[i].L[1] != 0.0) ndual_pre++;
+            }
+            if (ndual_pre >= 4) pppos(pvt->rtk, obs, nobs, pvt->nav);
+            else sdr_log(3, "$LOG,%.3f,PPPOS SKIPPED (ndual=%d)", time, ndual_pre);
+        }
         } /* end else (sc_clk_ready) */
 
         // Reference PPP: normal PPP on uncorrected obs for SC AOWR evaluation.
@@ -1842,11 +1852,13 @@ static void update_sol(sdr_pvt_t *pvt)
                     dops(rns, razels, 0.0, rdop);
                 }
                 sdr_log(3, "$REFPOS,%.3f,%.0f,%.0f,%.0f,%.0f,%.0f,%.3f,"
-                    "%.9f,%.9f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.9f,%.1f,%.1f,%.1f,%.1f,%.3e",
+                    "%.9f,%.9f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.9f,%.1f,%.1f,%.1f,%.1f,%.3e,"
+                    "%.4f,%.4f,%.4f",
                     time, ep[0],ep[1],ep[2],ep[3],ep[4],ep[5],
                     pos[0]*R2D, pos[1]*R2D, pos[2], rsol->stat, rsol->ns,
                     SQRT(Q[4]), SQRT(Q[0]), SQRT(Q[8]), rdtr,
-                    rdop[0], rdop[1], rdop[2], rdop[3], rsol->dtr[5]);
+                    rdop[0], rdop[1], rdop[2], rdop[3], rsol->dtr[5],
+                    rsol->rr[3], rsol->rr[4], rsol->rr[5]);
             }
         }
 
@@ -1989,11 +2001,13 @@ static void update_sol(sdr_pvt_t *pvt)
                 dops(rns, razels, ref_opt.elmin, rdop);
             }
             sdr_log(3, "$REFPOS,%.3f,%.0f,%.0f,%.0f,%.0f,%.0f,%.3f,"
-                "%.9f,%.9f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.9f,%.1f,%.1f,%.1f,%.1f,%.3e",
+                "%.9f,%.9f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.9f,%.1f,%.1f,%.1f,%.1f,%.3e,"
+                "%.4f,%.4f,%.4f",
                 time, ep[0],ep[1],ep[2],ep[3],ep[4],ep[5],
                 pos[0]*R2D, pos[1]*R2D, pos[2], ref_sol.stat, ref_sol.ns,
                 SQRT(Q[4]), SQRT(Q[0]), SQRT(Q[8]), dtr_s,
-                rdop[0], rdop[1], rdop[2], rdop[3], ref_sol.dtr[5]);
+                rdop[0], rdop[1], rdop[2], rdop[3], ref_sol.dtr[5],
+                ref_sol.rr[3], ref_sol.rr[4], ref_sol.rr[5]);
         }
     }
 
@@ -2093,7 +2107,8 @@ void sdr_pvt_udsol(sdr_pvt_t *pvt, int64_t ix)
         // adjust epoch cycle within 20 ms
         // pntpos (stat=SINGLE) stores dtr in seconds; pppos (stat=PPP) stores in meters.
         // Same rule as out_log_pos(): check sol->stat, not sdr_pmode.
-        if (pvt->sol->stat) {
+        // Skip for GS side: epoch adjustment would corrupt AOWR timing fed to SC.
+        if (pvt->sol->stat && !sdr_ps_gs_mode) {
             double dtr_s = pvt->sol->dtr[0];
             if (pvt->sol->stat == SOLQ_PPP && !(sdr_ps_sc_mode && s_sc_hist_n > 0))
                 dtr_s /= CLIGHT;
@@ -2102,6 +2117,14 @@ void sdr_pvt_udsol(sdr_pvt_t *pvt, int64_t ix)
                 pvt->ix += (int)(dtr / SDR_CYC);
                 sdr_log(3, "$LOG,%.3f,PVT EPOCH ADJUSTED (DT=%.3fs)",
                     pvt->ix * SDR_CYC, dtr);
+                /* Epoch shift changes the local time reference by dtr seconds.
+                 * All AOWR clock offsets (which measure receiver_local - GPS_time)
+                 * must be reduced by the same amount to remain coherent. */
+                if (sdr_ps_sc_mode) {
+                    s_sc_dt_i -= dtr;
+                    s_sc_last_dt_aowr -= dtr;
+                    for (int k = 0; k < s_sc_hist_n; k++) s_sc_clk_hist[k] -= dtr;
+                }
             }
         }
     }
