@@ -45,6 +45,7 @@ def parse_log(path):
       t,year,month,day,hour,min,sec,lat,lon,hgt,q,ns,stdn,stde,stdu,dtr [17 fields]
       + ecef_x,ecef_y,ecef_z,vel_x,vel_y,vel_z                          [+6, len>=23]
       + gdop,pdop,hdop,vdop                                              [+4, len>=27]
+      + dtr_drift                                                        [+1, len>=28]
     """
     rows = []
     with open(path, errors='replace') as f:
@@ -83,6 +84,8 @@ def parse_log(path):
                     r['pdop'] = float(p[24])
                     r['hdop'] = float(p[25])
                     r['vdop'] = float(p[26])
+                if len(p) >= 28:
+                    r['dtr_drift'] = float(p[27])
                 rows.append(r)
             except (ValueError, IndexError):
                 continue
@@ -155,6 +158,7 @@ def parse_refpos_log(path):
     $REFPOS format (4-unknown solve, clock estimated, no ECEF/velocity):
       t,year,month,day,hour,min,sec,lat,lon,hgt,stat,ns,stdn,stde,stdu,dtr [17 fields]
       + gdop,pdop,hdop,vdop                                                 [+4, len>=21]
+      + dtr_drift                                                           [+1, len>=22]
     """
     rows = []
     with open(path, errors='replace') as f:
@@ -182,6 +186,8 @@ def parse_refpos_log(path):
                     r['pdop'] = float(p[18])
                     r['hdop'] = float(p[19])
                     r['vdop'] = float(p[20])
+                if len(p) >= 22:
+                    r['dtr_drift'] = float(p[21])
                 rows.append(r)
             except (ValueError, IndexError):
                 continue
@@ -374,6 +380,8 @@ def make_df(rows):
         'stde_m':        r['stde'],
         'stdu_m':        r['stdu'],
         'dtr_s':         r['dtr'],
+        # Clock drift rate (s/s): Doppler-derived in SPP; WLS in SC AOWR; 0 in PPP
+        'dtr_drift_s':   r.get('dtr_drift', _nan),
         # DOP (NaN for old logs without DOP fields)
         # For $POS (clock-corrected): gdop=0, pdop=PDOP3 (position-only, no clock coupling)
         # For $REFPOS (4-unknown):    gdop=GDOP, pdop=PDOP with clock-position coupling
