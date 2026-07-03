@@ -1223,12 +1223,10 @@ void sdr_pvt_udobs(sdr_pvt_t *pvt, int64_t ix, sdr_ch_t *ch)
             (ch->nav->fsync > 0 || ch->trk->sec_sync > 0)) {
             gtime_t gt = timeadd(pvt->time, (ix - pvt->ix) * SDR_CYC);
             double P = gen_prng(gt, ch);
-            if (P > 0.0) {
-                double L = gen_cphas(ch, P);
-                if (ch->fi != 0.0)         L += ch->fi         * (ch->lock * ch->T);
-                if (sdr_ps_freq_err != 0.0) L += sdr_ps_freq_err * (ch->lock * ch->T);
-                update_aowr(ix * SDR_CYC, gt, P, L);
-            }
+            double L = gen_cphas(ch, P);
+            if (ch->fi != 0.0)         L += ch->fi         * (ch->lock * ch->T);
+            if (sdr_ps_freq_err != 0.0) L += sdr_ps_freq_err * (ch->lock * ch->T);
+            update_aowr(ix * SDR_CYC, gt, P, L);
         }
     }
     sdr_mutex_unlock(&pvt->mtx);
