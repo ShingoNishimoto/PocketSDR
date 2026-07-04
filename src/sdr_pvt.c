@@ -1737,11 +1737,41 @@ static void update_sol(sdr_pvt_t *pvt)
             sdr_log(3, "$LOG,%.3f,SPP_SEED seeded from REF pos %.1f %.1f %.1f",
                 time, pvt->rtk->sol.rr[0], pvt->rtk->sol.rr[1], pvt->rtk->sol.rr[2]);
         }
+        // Save a reliable position seed. pntpos may converge to a wrong position
+        // when an outlier satellite dominates the WLS; use the KF position (which
+        // is maintained by pppos independently) so the RAIM-FDE fallback below
+        // always starts from a sane initial point.
+        double spp_rr0[3];
+        for (int j = 0; j < 3; j++)
+            spp_rr0[j] = norm(pvt->rtk->x, 3) > 1.0 ? pvt->rtk->x[j]
+                                                      : pvt->rtk->sol.rr[j];
+
         pntpos(obs, nobs, pvt->nav, &spopt, &pvt->rtk->sol, NULL, pvt->rtk->ssat, msg);
         if (pvt->rtk->sol.stat) spp_sol = pvt->rtk->sol;
         sdr_log(3, "$LOG,%.3f,SPP_SEED stat=%d dtr=%.9f msg=%s",
             time, pvt->rtk->sol.stat, pvt->rtk->sol.dtr[0],
             pvt->rtk->sol.stat ? "ok" : msg);
+
+        // RAIM-FDE fallback: when all-satellite pntpos fails (e.g., a newly acquired
+        // satellite with a code-period ambiguity causes WLS divergence), try excluding
+        // each satellite in turn.  udclk_ppp() reinitialises the PPP KF clock from
+        // sol.dtr[0] every epoch, so a wrong SPP clock contaminates pppos as well.
+        // Excluding the outlier satellite restores a valid dtr and unblocks pppos.
+        if (!pvt->rtk->sol.stat && nobs > 5) {
+            for (int exc = 0; exc < nobs && !pvt->rtk->sol.stat; exc++) {
+                obsd_t oe[MAXOBS]; int ne = 0;
+                for (int j = 0; j < nobs; j++) if (j != exc) oe[ne++] = obs[j];
+                sol_t st = pvt->rtk->sol;
+                for (int j = 0; j < 3; j++) st.rr[j] = spp_rr0[j];
+                pntpos(oe, ne, pvt->nav, &spopt, &st, NULL, pvt->rtk->ssat, msg);
+                if (st.stat) {
+                    pvt->rtk->sol = st;
+                    sdr_log(3, "$LOG,%.3f,SPP_RAIM excl=%d ok dtr=%.9f",
+                        time, exc, st.dtr[0]);
+                }
+            }
+            if (pvt->rtk->sol.stat) spp_sol = pvt->rtk->sol;
+        }
 
         // Initialize clock states from pntpos when x[IC]=0.
         // udclk_ppp() initializes clocks only when norm(x[0:3])=0, but udpos_ppp()
