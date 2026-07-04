@@ -457,14 +457,24 @@ def main():
     args = ap.parse_args()
 
     rows = parse_log(args.logfile)
-    if not rows:
+    if rows:
+        ppp_n = sum(1 for r in rows if r['q'] == 6)
+        spp_n = len(rows) - ppp_n
+        print(f'Parsed {len(rows)} $POS records from {args.logfile}'
+              f'  ({ppp_n} PPP, {spp_n} SPP)')
+    else:
         print(f'No $POS records in {args.logfile}', file=sys.stderr)
-        sys.exit(1)
 
-    ppp_n = sum(1 for r in rows if r['q'] == 6)
-    spp_n = len(rows) - ppp_n
-    print(f'Parsed {len(rows)} $POS records from {args.logfile}'
-          f'  ({ppp_n} PPP, {spp_n} SPP)')
+    ref_rows = parse_refpos_log(args.logfile)
+    if ref_rows:
+        rppp_n = sum(1 for r in ref_rows if r['q'] == 6)
+        rspp_n = len(ref_rows) - rppp_n
+        print(f'Parsed {len(ref_rows)} $REFPOS records'
+              f'  ({rppp_n} PPP, {rspp_n} SPP)')
+
+    if not rows and not ref_rows:
+        print('No position records found, exiting.', file=sys.stderr)
+        sys.exit(1)
 
     # Merge SPP seed clock entries into rows for debug export.
     # REF_SPP_SEED (PPP mode) and REF_SPP (SPP mode) both carry the reference
@@ -489,13 +499,6 @@ def main():
                 r['sc_aowr_clk']   = sc_aowr[r['t']]['clk']
                 r['sc_aowr_drift'] = sc_aowr[r['t']]['drift']
         print(f'Merged {len(sc_aowr)} SC_AOWR clock/drift entries')
-
-    ref_rows = parse_refpos_log(args.logfile)
-    if ref_rows:
-        rppp_n = sum(1 for r in ref_rows if r['q'] == 6)
-        rspp_n = len(ref_rows) - rppp_n
-        print(f'Parsed {len(ref_rows)} $REFPOS records'
-              f'  ({rppp_n} PPP, {rspp_n} SPP)')
 
     stem = os.path.splitext(args.logfile)[0]
     ref_stem = stem + '_ref'

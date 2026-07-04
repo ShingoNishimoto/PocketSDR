@@ -78,8 +78,9 @@ char   sdr_ps_sc_file[256] = "./dt_aowr_gnss.txt"; // input file: dt_aowr_gnss.t
 // SC binary seqlock file — matches hybrid_shared_data in gnss-sdr rtklib_pvt_gs.h
 // Layout: 2 slots of aowr_gs_shared_t (64 bytes total); reader uses slot 0 only.
 #define SC_FILE_SIZE       ((int)(sizeof(aowr_gs_shared_t) * 2))  // 64 bytes
+static uint64_t s_sc_last_seq = 0; // last consumed seqlock sequence number
 // Clock history for WLS drift estimation (mirrors linear_regression_by_wls in gnss-sdr).
-#define SC_CLOCK_HIST_SIZE 5
+#define SC_CLOCK_HIST_SIZE 3
 
 static int    s_sc_fd          = -1;
 static void  *s_sc_map         = NULL;
@@ -875,8 +876,12 @@ static void open_aowr_sc(void)
         s_sc_map = NULL; close(s_sc_fd); s_sc_fd = -1; return;
     }
     s_sc_hist_n = 0;
-    sdr_log(3, "$LOG,0,,0,SC mode: reading AOWR clock from %s (hist=%d)",
-        sdr_ps_sc_file, SC_CLOCK_HIST_SIZE);
+    /* Prime s_sc_last_seq with the file's current seq so stale data from a
+     * previous run is skipped; only new GS writes after this point are read. */
+    aowr_gs_shared_t *p0 = (aowr_gs_shared_t *)s_sc_map;
+    s_sc_last_seq = p0->seq;
+    sdr_log(3, "$LOG,0,,0,SC mode: reading AOWR clock from %s (hist=%d, skip_seq=%llu)",
+        sdr_ps_sc_file, SC_CLOCK_HIST_SIZE, (unsigned long long)s_sc_last_seq);
 #endif
 }
 
@@ -897,15 +902,14 @@ static int read_aowr_sc(double *tag_tow, double *clock_diff_s, double *range_m)
 #ifndef WIN32
     if (!s_sc_map) return 0;
     aowr_gs_shared_t *p = (aowr_gs_shared_t *)s_sc_map;
-    static uint64_t last_seq = 0;
     uint64_t seq_before = p->seq;
     __sync_synchronize();
     aowr_gs_shared_t snap = *p;
     __sync_synchronize();
     uint64_t seq_after = p->seq;
-    if (seq_before != seq_after) return 0;    // write in progress: odd seq
-    if (seq_after == 0 || seq_after == last_seq) return 0;  // uninitialized or stale
-    last_seq      = seq_after;
+    if (seq_before != seq_after) return 0;        // write in progress
+    if (seq_after == 0 || seq_after == s_sc_last_seq) return 0;  // uninitialized or stale
+    s_sc_last_seq = seq_after;
     *tag_tow      = snap.tag_tow;
     *clock_diff_s = snap.clock_diff_s;
     *range_m      = snap.range_m;
@@ -1725,17 +1729,18 @@ static void update_sol(sdr_pvt_t *pvt)
             pvt->rtk->sol.rr[1] = sdr_fixpos[1];
             pvt->rtk->sol.rr[2] = sdr_fixpos[2];
         }
-        // When using clock_bias_fixed, position must be seeded from somewhere non-zero.
-        // Starting from geocenter (0,0,0) makes all sats appear at el=90° → degenerate PDOP.
-        // REF solver runs from epoch 0 (before AOWR clock arrives), so by the time
-        // sc_clk_ready=1, s_sc_ref_rtk->sol.rr already has a converged position.
-        if (sc_clk_ready && norm(pvt->rtk->sol.rr, 3) < 1.0 &&
-            s_sc_ref_rtk && norm(s_sc_ref_rtk->sol.rr, 3) > 1.0) {
+        // Seed clock_bias_fixed pntpos from REF every epoch: the 3-unknown solve
+        // has no clock unknown to absorb linearisation errors, so a good starting
+        // position is critical. REF PPP converges independently of sc_clk_ready,
+        // so s_sc_ref_rtk->sol.rr is valid well before the first AOWR epoch.
+        if (sc_clk_ready && s_sc_ref_rtk && norm(s_sc_ref_rtk->sol.rr, 3) > 1.0) {
+            if (norm(pvt->rtk->sol.rr, 3) < 1.0)
+                sdr_log(3, "$LOG,%.3f,SPP_SEED first seed from REF %.1f %.1f %.1f",
+                    time, s_sc_ref_rtk->sol.rr[0],
+                    s_sc_ref_rtk->sol.rr[1], s_sc_ref_rtk->sol.rr[2]);
             pvt->rtk->sol.rr[0] = s_sc_ref_rtk->sol.rr[0];
             pvt->rtk->sol.rr[1] = s_sc_ref_rtk->sol.rr[1];
             pvt->rtk->sol.rr[2] = s_sc_ref_rtk->sol.rr[2];
-            sdr_log(3, "$LOG,%.3f,SPP_SEED seeded from REF pos %.1f %.1f %.1f",
-                time, pvt->rtk->sol.rr[0], pvt->rtk->sol.rr[1], pvt->rtk->sol.rr[2]);
         }
         // Save a reliable position seed. pntpos may converge to a wrong position
         // when an outlier satellite dominates the WLS; use the KF position (which
