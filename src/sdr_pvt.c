@@ -1708,6 +1708,12 @@ static void update_sol(sdr_pvt_t *pvt)
         spopt.navsys |= SYS_GLO | SYS_GAL | SYS_QZS | SYS_CMP | SYS_IRN;
         spopt.elmin   = sdr_el_mask * D2R;
         spopt.maxgdop = sdr_maxgdop;
+        // dtr[0..NSYS-1] holds meters when the previous epoch was PPP (SOLQ_PPP).
+        // pntpos expects seconds; without this conversion all residuals are ~300 km off
+        // and pntpos rejects every satellite as an outlier ("lack of valid sats").
+        if (pvt->rtk->sol.stat == SOLQ_PPP) {
+            for (int i = 0; i < NSYS; i++) pvt->rtk->sol.dtr[i] /= CLIGHT;
+        }
         if (sc_clk_ready) {
             spopt.clock_bias_fixed = 1; /* P/L pre-corrected → 3-unknown solve */
             pvt->rtk->sol.dtr[0] = clock_est; /* fixed clock bias (seconds) */
