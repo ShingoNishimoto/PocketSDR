@@ -73,5 +73,8 @@ fftw_wisdom.o: $(SRC)/pocket_sdr.h
 clean:
 	rm -f $(TARGET) *.exe *.o *.obj *.stackdump
 
+INSTALL_DIR ?= /usr/local/bin
+
 install:
 	cp $(TARGET) $(BIN)
+	cp pocket_trk $(INSTALL_DIR)/pocket_trk

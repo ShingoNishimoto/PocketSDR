@@ -87,6 +87,7 @@ static void  *s_sc_map         = NULL;
 static double s_sc_last_dt_aowr = 0.0; // last valid dt_aowr_cp on SC side
 static int    s_sc_ps_ever_obs  = 0;   // 1 once PS has been observed on SC side
 static double s_sc_rx_clock     = 0.0; // latest AOWR-derived clock offset (s)
+static double s_sc_last_tag_tow = 0.0; // tag_tow from the last AOWR file read
 static double s_sc_clk_hist[SC_CLOCK_HIST_SIZE]; // rx clock offset at each reading
 static double s_sc_tow_hist[SC_CLOCK_HIST_SIZE]; // SC GNSS TOW at each reading
 static int    s_sc_hist_n      = 0;    // valid entries (0..SC_CLOCK_HIST_SIZE)
@@ -1503,6 +1504,17 @@ static void update_aowr(double time, gtime_t gtime, double P, double L)
         initialized = 1;
     }
 
+    /* Strip GPS week-number contribution from the PS pseudorange.
+     * The PS navigation message may carry a wrong week number (e.g. stale
+     * firmware value), causing P/c to jump by an integer multiple of 604800 s.
+     * Folding dt_current to within ±302400 s of the initial reference makes
+     * the computation depend only on TOW, not the week number. */
+    {
+        double delta = dt_current - (double)dt_int_s;
+        delta -= 604800.0 * round(delta / 604800.0);
+        dt_current = (double)dt_int_s + delta;
+    }
+
     double dt0 = count > 0 ? (double)dt_int_s + dt0_frac_sum / count : 0.0;
     double dt0_current = dt_current - sdr_ps_dist / CLIGHT - Ci;
 
@@ -1641,7 +1653,16 @@ static void update_sol(sdr_pvt_t *pvt)
         double tag_tow, clock_diff_s, range_m;
         if (read_aowr_sc(&tag_tow, &clock_diff_s, &range_m)) {
             double new_clock = s_sc_last_dt_aowr + clock_diff_s;
-            double new_tow   = tag_tow + s_sc_last_dt_aowr; /* SC GNSS TOW */
+            /* SC GNSS TOW: tag_tow (PS tx time) + SC pseudorange offset.
+             * May be negative due to GPS week rollover — wrap to [0, 604800). */
+            double new_tow = tag_tow + s_sc_last_dt_aowr;
+            while (new_tow <      0.0) new_tow += 604800.0;
+            while (new_tow >= 604800.0) new_tow -= 604800.0;
+            s_sc_last_tag_tow = tag_tow;
+
+            sdr_log(3, "$LOG,%.3f,SC_AOWR_RAW tag_tow=%.3f clock_diff=%.9f"
+                " last_dt=%.9f new_clk=%.9f",
+                time, tag_tow, clock_diff_s, s_sc_last_dt_aowr, new_clock);
 
             /* Append to history; shift oldest out when full */
             if (s_sc_hist_n < SC_CLOCK_HIST_SIZE) {
@@ -1677,19 +1698,18 @@ static void update_sol(sdr_pvt_t *pvt)
             }
         }
 
-        /* (c) Extrapolate AOWR clock and pre-correct obs when clock data available */
-        if (s_sc_rx_clock != 0.0 && s_sc_hist_n > 0 && nobs > 0) {
+        /* (c) Extrapolate AOWR clock to current epoch using obs[0].time as GPS TOW. */
+        if (s_sc_rx_clock != 0.0 && s_sc_hist_n > 0 && nobs > 0 &&
+                s_sc_last_tag_tow > 0.0) {
             int wn;
             double current_tow = time2gpst(obs[0].time, &wn);
-            clock_est          = s_sc_dt_i +
-                                 s_sc_clock_drift * (current_tow - s_sc_tow_hist[0]);
-            sc_clk_ready       = 1;
+            double dt = current_tow - s_sc_tow_hist[0];
+            if (dt < 0.0) dt += 604800.0;
+            clock_est    = s_sc_dt_i + s_sc_clock_drift * dt;
+            sc_clk_ready = 1;
 
             sdr_log(3, "$LOG,%.3f,SC_AOWR clk=%.9f drift=%.3e dt=%.3f hist=%d",
-                time, clock_est, s_sc_clock_drift,
-                current_tow - s_sc_tow_hist[0], s_sc_hist_n);
-            /* Observations used as-is; clock offset passed via sol.dtr[0] so
-             * pntpos/pppos subtract it in range residuals (clock_bias_fixed=1). */
+                time, clock_est, s_sc_clock_drift, dt, s_sc_hist_n);
         }
     }
 
@@ -1729,15 +1749,14 @@ static void update_sol(sdr_pvt_t *pvt)
             pvt->rtk->sol.rr[1] = sdr_fixpos[1];
             pvt->rtk->sol.rr[2] = sdr_fixpos[2];
         }
-        // Seed clock_bias_fixed pntpos from REF every epoch: the 3-unknown solve
-        // has no clock unknown to absorb linearisation errors, so a good starting
-        // position is critical. REF PPP converges independently of sc_clk_ready,
-        // so s_sc_ref_rtk->sol.rr is valid well before the first AOWR epoch.
-        if (sc_clk_ready && s_sc_ref_rtk && norm(s_sc_ref_rtk->sol.rr, 3) > 1.0) {
-            if (norm(pvt->rtk->sol.rr, 3) < 1.0)
-                sdr_log(3, "$LOG,%.3f,SPP_SEED first seed from REF %.1f %.1f %.1f",
-                    time, s_sc_ref_rtk->sol.rr[0],
-                    s_sc_ref_rtk->sol.rr[1], s_sc_ref_rtk->sol.rr[2]);
+        // One-time bootstrap: seed position from REF only when SC position is
+        // still zero (never solved yet). After first convergence the SC solver
+        // is independent; it must NOT be overridden by REF every epoch.
+        if (sc_clk_ready && s_sc_ref_rtk && norm(s_sc_ref_rtk->sol.rr, 3) > 1.0
+            && norm(pvt->rtk->sol.rr, 3) < 1.0) {
+            sdr_log(3, "$LOG,%.3f,SPP_SEED first seed from REF %.1f %.1f %.1f",
+                time, s_sc_ref_rtk->sol.rr[0],
+                s_sc_ref_rtk->sol.rr[1], s_sc_ref_rtk->sol.rr[2]);
             pvt->rtk->sol.rr[0] = s_sc_ref_rtk->sol.rr[0];
             pvt->rtk->sol.rr[1] = s_sc_ref_rtk->sol.rr[1];
             pvt->rtk->sol.rr[2] = s_sc_ref_rtk->sol.rr[2];
@@ -1776,6 +1795,14 @@ static void update_sol(sdr_pvt_t *pvt)
                 }
             }
             if (pvt->rtk->sol.stat) spp_sol = pvt->rtk->sol;
+        }
+        /* In clock_bias_fixed mode, a failed pntpos corrupts sol.rr via diverged
+         * Newton iterations.  Restore it to the pre-pntpos seed so the next epoch
+         * starts from the same clean position instead of drifting further away. */
+        if (!pvt->rtk->sol.stat && sc_clk_ready) {
+            pvt->rtk->sol.rr[0] = spp_rr0[0];
+            pvt->rtk->sol.rr[1] = spp_rr0[1];
+            pvt->rtk->sol.rr[2] = spp_rr0[2];
         }
 
         // Initialize clock states from pntpos when x[IC]=0.
@@ -1969,6 +1996,9 @@ static void update_sol(sdr_pvt_t *pvt)
             if (sc_clk_ready) pvt->sol->dtr[5] = s_sc_clock_drift;
             output_sol(pvt, time);
         } else {
+            /* Clear rr so the display shows no position rather than the
+             * corrupted/seeded position from a failed solver. */
+            pvt->sol->rr[0] = pvt->sol->rr[1] = pvt->sol->rr[2] = 0.0;
             update_azel(pvt->nav, pvt->sol, pvt->ssat);
             pvt->sol->ns = 0;
             sdr_log(3, "$LOG,%.3f,PPPOS NO SOLUTION", time);
@@ -2160,9 +2190,15 @@ void sdr_pvt_udsol(sdr_pvt_t *pvt, int64_t ix)
                  * All AOWR clock offsets (which measure receiver_local - GPS_time)
                  * must be reduced by the same amount to remain coherent. */
                 if (sdr_ps_sc_mode) {
-                    s_sc_dt_i -= dtr;
+                    s_sc_dt_i         -= dtr;
                     s_sc_last_dt_aowr -= dtr;
-                    for (int k = 0; k < s_sc_hist_n; k++) s_sc_clk_hist[k] -= dtr;
+                    for (int k = 0; k < s_sc_hist_n; k++) {
+                        s_sc_clk_hist[k] -= dtr;
+                        /* time2gpst(obs[0].time) advances by dtr after each ix
+                         * correction; tow_hist must track the same shift so dt
+                         * (current_tow - tow_hist[0]) stays smooth. */
+                        s_sc_tow_hist[k] += dtr;
+                    }
                 }
             }
         }

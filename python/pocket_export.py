@@ -417,8 +417,11 @@ def write_csv(rows, path, label=''):
 
 def write_excel(rows, path, ref_rows=None):
     df = make_df(rows)
-    ppp_df = df[df['quality'] == 6]
-    spp_df = df[df['quality'] != 6]
+    if 'quality' in df.columns:
+        ppp_df = df[df['quality'] == 6]
+        spp_df = df[df['quality'] != 6]
+    else:
+        ppp_df = spp_df = df
     with pd.ExcelWriter(path, engine='openpyxl') as xw:
         df.to_excel(xw, sheet_name='All', index=False)
         ppp_df.to_excel(xw, sheet_name='PPP', index=False)
