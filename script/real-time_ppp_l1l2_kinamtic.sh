@@ -27,7 +27,9 @@ build_nav_args() {
 date_str="`date +'%Y%m%d%H%M%S'`"
 mkdir $date_str
 
-cp $conffile $date_str
+cp $conffile $date_str/
+cp $confpath/ppp_kinematic_drone.ini $date_str/
+cp $0 $date_str/
 [ -n "$SP3_FILE" ] && cp "$SP3_FILE" $date_str/ 2>/dev/null
 [ -n "$CLK_FILE" ] && cp "$CLK_FILE" $date_str/ 2>/dev/null
 
