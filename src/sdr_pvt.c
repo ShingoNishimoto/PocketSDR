@@ -1953,7 +1953,16 @@ static void update_sol(sdr_pvt_t *pvt)
             }
         }
 
-        // Diagnostics: log KF position state and dual-freq measurement count
+        // Diagnostics: log KF position, clock, troposphere ZWD, LC ambiguity
+        // convergence, and post-fit carrier residuals for PPP convergence monitoring.
+        //
+        // State vector layout (ppp.c macros, IONOOPT_IFLC, TROPOPT_ESTG):
+        //   NP = dynamics ? 9 : 3   (pos/vel/acc)
+        //   IC(0) = NP              (GPS clock, metres)
+        //   IT     = NP + NSYS      (ZWD)
+        //   NT     = 3              (ZWD + NS/EW gradients)
+        //   NR     = NP + NSYS + NT (start of LC ambiguities)
+        //   IB(s)  = NR + s - 1    (LC ambiguity for satellite s)
         {
             double *x = pvt->rtk->x;
             double *P = pvt->rtk->P;
@@ -1963,10 +1972,43 @@ static void update_sol(sdr_pvt_t *pvt)
                 if (obs[i].code[1] && obs[i].P[1] != 0.0 && obs[i].L[1] != 0.0) ndualfreq++;
             }
             double pos_std = nx > 0 ? sqrt(P[0]+P[1+nx]+P[2+2*nx]) : -1;
-            int np = pvt->rtk->opt.dynamics ? 9 : 3;
-            double x_clk = nx > np ? x[np] : 0.0;
-            sdr_log(3, "$LOG,%.3f,PPPOS_DBG kf_pos=%.1f,%.1f,%.1f pos_std=%.3f ndual=%d stat=%d clk=%.3f",
-                time, x[0], x[1], x[2], pos_std, ndualfreq, pvt->rtk->sol.stat, x_clk);
+
+            int np_i = pvt->rtk->opt.dynamics ? 9 : 3;
+            double x_clk  = nx > np_i ? x[np_i] : 0.0;
+            double clk_std = nx > np_i ? sqrt(P[np_i + np_i*nx]) : 0.0;
+
+            /* troposphere ZWD: IT = NP + NSYS */
+            int it = np_i + NSYS;
+            int nt = pvt->rtk->opt.tropopt == TROPOPT_ESTG ? 3 :
+                     pvt->rtk->opt.tropopt == TROPOPT_EST  ? 1 : 0;
+            double zwd     = (nt > 0 && nx > it) ? x[it]              : 0.0;
+            double zwd_std = (nt > 0 && nx > it) ? sqrt(P[it+it*nx])  : 0.0;
+
+            /* LC ambiguities: IB(s,0) = NR + s - 1, NR = NP + NSYS + NT */
+            int nr = np_i + NSYS + nt;
+            double amb_var_sum = 0.0;
+            double res_c_sq   = 0.0;
+            int namb = 0, nconv = 0, nres = 0;
+            for (int i = 0; i < MAXSAT; i++) {
+                if (!pvt->rtk->ssat[i].vsat[0]) continue;
+                int ib = nr + i;
+                if (nx > ib && x[ib] != 0.0) {
+                    amb_var_sum += P[ib + ib*nx];
+                    namb++;
+                    if (sqrt(P[ib + ib*nx]) < 0.5) nconv++;
+                }
+                double rc = pvt->rtk->ssat[i].resc[0];
+                if (rc != 0.0) { res_c_sq += rc * rc; nres++; }
+            }
+            double amb_std = namb > 0 ? sqrt(amb_var_sum / namb) : 0.0;
+            double res_c   = nres > 0 ? sqrt(res_c_sq   / nres)  : 0.0;
+
+            sdr_log(3, "$LOG,%.3f,PPPOS_DBG"
+                " kf_pos=%.1f,%.1f,%.1f pos_std=%.3f"
+                " ndual=%d stat=%d clk=%.3f clk_std=%.3f"
+                " zwd=%.4f zwd_std=%.4f amb_std=%.3f nconv=%d res_c=%.4f",
+                time, x[0], x[1], x[2], pos_std, ndualfreq, pvt->rtk->sol.stat,
+                x_clk, clk_std, zwd, zwd_std, amb_std, nconv, res_c);
         }
 
         // udbias_ppp() increments outc every epoch; update_stat() resets it but

@@ -120,6 +120,54 @@ def parse_sc_aowr_log(path):
     return result
 
 
+def parse_pppos_dbg_log(path):
+    """Parse $LOG,<t>,PPPOS_DBG entries for PPP convergence monitoring.
+
+    Handles both old format (no clk_std/zwd/amb_std fields) and new format.
+    Returns: {t: {pos_std, stat, ndual, clk, clk_std, zwd, zwd_std,
+                  amb_std, nconv, res_c}, ...}
+    """
+    def _fv(msg, key):
+        try:
+            return float(msg.split(key + '=')[1].split()[0])
+        except (IndexError, ValueError):
+            return float('nan')
+
+    def _iv(msg, key):
+        try:
+            return int(float(msg.split(key + '=')[1].split()[0]))
+        except (IndexError, ValueError):
+            return None
+
+    result = {}
+    with open(path, errors='replace') as f:
+        for line in f:
+            line = line.strip()
+            if not line.startswith('$LOG,'):
+                continue
+            p = line.split(',', 2)
+            if len(p) < 3 or not p[2].startswith('PPPOS_DBG '):
+                continue
+            try:
+                t   = float(p[1])
+                msg = p[2]
+                result[t] = {
+                    'pos_std': _fv(msg, 'pos_std'),
+                    'stat':    _iv(msg, 'stat'),
+                    'ndual':   _iv(msg, 'ndual'),
+                    'clk':     _fv(msg, 'clk'),
+                    'clk_std': _fv(msg, 'clk_std'),
+                    'zwd':     _fv(msg, 'zwd'),
+                    'zwd_std': _fv(msg, 'zwd_std'),
+                    'amb_std': _fv(msg, 'amb_std'),
+                    'nconv':   _iv(msg, 'nconv'),
+                    'res_c':   _fv(msg, 'res_c'),
+                }
+            except (ValueError, IndexError):
+                continue
+    return result
+
+
 def parse_spp_seed_log(path, tag):
     """Parse $LOG entries with a given tag and return a dict keyed by t.
 
@@ -406,6 +454,17 @@ def make_df(rows):
         # SC_AOWR clock estimate and drift rate (NaN when AOWR not yet active)
         'sc_aowr_clk_s':  r.get('sc_aowr_clk',   _nan),
         'sc_aowr_drift':  r.get('sc_aowr_drift',  _nan),
+        # PPP KF convergence diagnostics from PPPOS_DBG (NaN when not in PPP mode
+        # or old logs without these fields)
+        'ppp_kf_pos_std_m': r.get('ppp_pos_std', _nan),
+        'ppp_kf_ndual':     r.get('ppp_ndual',   _nan),
+        'ppp_clk_m':        r.get('ppp_clk',     _nan),
+        'ppp_clk_std_m':    r.get('ppp_clk_std', _nan),
+        'ppp_zwd_m':        r.get('ppp_zwd',     _nan),
+        'ppp_zwd_std_m':    r.get('ppp_zwd_std', _nan),
+        'ppp_amb_std_m':    r.get('ppp_amb_std', _nan),
+        'ppp_nconv':        r.get('ppp_nconv',   _nan),
+        'ppp_res_c_m':      r.get('ppp_res_c',   _nan),
     } for r in rows])
 
 def write_csv(rows, path, label=''):
@@ -502,6 +561,22 @@ def main():
                 r['sc_aowr_clk']   = sc_aowr[r['t']]['clk']
                 r['sc_aowr_drift'] = sc_aowr[r['t']]['drift']
         print(f'Merged {len(sc_aowr)} SC_AOWR clock/drift entries')
+
+    pppos_dbg = parse_pppos_dbg_log(args.logfile)
+    if pppos_dbg:
+        for r in rows:
+            if r['t'] in pppos_dbg:
+                d = pppos_dbg[r['t']]
+                r['ppp_pos_std'] = d['pos_std']
+                r['ppp_ndual']   = d['ndual']
+                r['ppp_clk']     = d['clk']
+                r['ppp_clk_std'] = d['clk_std']
+                r['ppp_zwd']     = d['zwd']
+                r['ppp_zwd_std'] = d['zwd_std']
+                r['ppp_amb_std'] = d['amb_std']
+                r['ppp_nconv']   = d['nconv']
+                r['ppp_res_c']   = d['res_c']
+        print(f'Merged {len(pppos_dbg)} PPPOS_DBG convergence entries')
 
     stem = os.path.splitext(args.logfile)[0]
     ref_stem = stem + '_ref'
