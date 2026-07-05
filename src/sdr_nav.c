@@ -485,6 +485,19 @@ static void decode_LNAV(sdr_ch_t *ch, const uint8_t *syms, int rev)
         int sf = getbitu(data, 43, 3);
         if (sf == 1) {
             ch->week = getbitu(data, 48, 10) + GPST_OFF_W;
+            /* Validate decoded week against current GPS time. Pseudosatellite
+             * firmware may carry a stale week number hundreds of weeks off,
+             * causing the satellite position to be computed at the wrong GPS
+             * time and the pseudorange to jump by N*604800*c metres.
+             * Replace with the current GPS week if the discrepancy exceeds
+             * 52 weeks (~1 year). */
+            {
+                int cur_week;
+                time2gpst(utc2gpst(timeget()), &cur_week);
+                if (abs(ch->week - cur_week) > 52) {
+                    ch->week = cur_week;
+                }
+            }
         }
         update_tow(ch, getbitu(data, 24, 17) * 6.0 + TOFF_L1CA);
         ch->nav->type = sf; // SF ID

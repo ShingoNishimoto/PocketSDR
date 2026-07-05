@@ -310,9 +310,9 @@ static void out_log_pos(double time, const sol_t *sol, int nsat,
     /* sol->dtr[0] unit depends on which solver produced the solution:
      *   pppos (stat=SOLQ_PPP)  → meters (= x[IC_GPS] from KF state)
      *   pntpos (stat=SOLQ_SINGLE) → seconds, even when pmode=PPP (SPP fallback)
-     * SC AOWR exception: pre-corrected obs make x[IC_GPS] ≈ 0 m, so the
-     * check below is correct (dtr_s ≈ 0 either way). */
-    int dtr_in_meters = (sol->stat == SOLQ_PPP) && !(sdr_ps_sc_mode && s_sc_hist_n > 0);
+     * PPP always uses uncorrected observations and estimates its own clock; dtr
+     * is always in meters regardless of AOWR mode. */
+    int dtr_in_meters = (sol->stat == SOLQ_PPP);
     double dtr_s      = dtr_in_meters ? sol->dtr[0] / CLIGHT : sol->dtr[0];
     time2epoch(timeadd(sol->time, dtr_s), ep);
     ecef2pos(sol->rr, pos);
@@ -2177,9 +2177,12 @@ void sdr_pvt_udsol(sdr_pvt_t *pvt, int64_t ix)
         // pntpos (stat=SINGLE) stores dtr in seconds; pppos (stat=PPP) stores in meters.
         // Same rule as out_log_pos(): check sol->stat, not sdr_pmode.
         // Skip for GS side: epoch adjustment would corrupt AOWR timing fed to SC.
-        if (pvt->sol->stat && !sdr_ps_gs_mode) {
+        // Skip for SC side once AOWR is providing the clock: pvt->ix must not shift
+        // because the AOWR clock manages the receiver epoch externally.
+        if (pvt->sol->stat && !sdr_ps_gs_mode &&
+                !(sdr_ps_sc_mode && s_sc_hist_n > 0)) {
             double dtr_s = pvt->sol->dtr[0];
-            if (pvt->sol->stat == SOLQ_PPP && !(sdr_ps_sc_mode && s_sc_hist_n > 0))
+            if (pvt->sol->stat == SOLQ_PPP)
                 dtr_s /= CLIGHT;
             double dtr = ROUND(dtr_s / 0.02) * 0.02;
             if (fabs(dtr) > 0.01) {
