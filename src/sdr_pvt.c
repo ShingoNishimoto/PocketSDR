@@ -30,6 +30,7 @@
 #define FILE_NAV       ".pocket_navdata.csv" // navigation data file
 #define MAXDTGLO       (86400.0*7.0) // max age of GLONASS almanac (s)
 #define MAXDTPOS       86400.0   // max age of last fix position (s)
+#define SC_SPP_FAIL_RESET 10     // PPP KF reset after this many consecutive SPP failures in SC mode
 
 #define ROUND(x)   (int)floor((x) + 0.5)
 #define SQRT(x)    ((x) > 0.0 ? sqrt(x) : 0.0)
@@ -94,6 +95,7 @@ static int    s_sc_hist_n      = 0;    // valid entries (0..SC_CLOCK_HIST_SIZE)
 static double s_sc_dt_i        = 0.0;  // WLS intercept at tow_hist[0] (s)
 static double s_sc_clock_drift = 0.0;  // WLS clock drift rate (s/s)
 static rtk_t *s_sc_ref_rtk    = NULL; // reference PPP solver (uncorrected obs)
+static int    s_spp_fail_n     = 0;    // consecutive SPP_SEED failures in SC clock-fixed mode
 
 /* SC antenna attitude — defined in lib/RTKLIB/src/rtkcmn.c (keeps librtk.a self-contained).
  * Set at startup from the options file; satazel() reads them in the antenna-frame path. */
@@ -1803,6 +1805,24 @@ static void update_sol(sdr_pvt_t *pvt)
             pvt->rtk->sol.rr[0] = spp_rr0[0];
             pvt->rtk->sol.rr[1] = spp_rr0[1];
             pvt->rtk->sol.rr[2] = spp_rr0[2];
+        }
+
+        /* PPP KF reset after consecutive SPP failures in SC clock-fixed mode.
+         * When SPP fails (AOWR clock has drifted), pppos() keeps propagating the
+         * position state unconstrained. After SC_SPP_FAIL_RESET epochs the KF
+         * position and phase biases are too inconsistent to re-converge; zeroing
+         * the full state lets pppos re-initialise cleanly on the next good epoch. */
+        if (sc_clk_ready) {
+            if (pvt->rtk->sol.stat) {
+                s_spp_fail_n = 0;
+            } else if (++s_spp_fail_n >= SC_SPP_FAIL_RESET) {
+                int nx = pvt->rtk->nx;
+                memset(pvt->rtk->x, 0, nx * sizeof(double));
+                memset(pvt->rtk->P, 0, nx * nx * sizeof(double));
+                s_spp_fail_n = 0;
+                sdr_log(3, "$LOG,%.3f,PPP_KF_RESET (SPP failed %d epochs in SC mode)",
+                    time, SC_SPP_FAIL_RESET);
+            }
         }
 
         // Initialize clock states from pntpos when x[IC]=0.
