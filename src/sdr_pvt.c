@@ -95,6 +95,7 @@ static int    s_sc_hist_n      = 0;    // valid entries (0..SC_CLOCK_HIST_SIZE)
 static double s_sc_dt_i        = 0.0;  // WLS intercept at tow_hist[0] (s)
 static double s_sc_clock_drift = 0.0;  // WLS clock drift rate (s/s)
 static rtk_t *s_sc_ref_rtk    = NULL; // reference PPP solver (uncorrected obs)
+static sol_t  s_sc_ref_sol     = {0};  // last reference solution (SPP mode; mirror of s_sc_ref_rtk->sol in PPP mode)
 static int    s_spp_fail_n     = 0;    // consecutive SPP_SEED failures in SC clock-fixed mode
 
 /* SC antenna attitude — defined in lib/RTKLIB/src/rtkcmn.c (keeps librtk.a self-contained).
@@ -2083,12 +2084,14 @@ static void update_sol(sdr_pvt_t *pvt)
             pvt->sol->ns = 0;
             sdr_log(3, "$LOG,%.3f,PNTPOS SUPPRESSED (SC no clock)", time);
         } else if (pntpos(obs, nobs, pvt->nav, &opt, pvt->sol, NULL, pvt->ssat, msg)) {
+            sdr_log(3, "$LOG,%.3f,SPP_SEED stat=%d dtr=%.9f msg=ok",
+                time, pvt->sol->stat, pvt->sol->dtr[0]);
             if (sc_clk_ready) pvt->sol->dtr[5] = s_sc_clock_drift;
             output_sol(pvt, time);
         } else {
+            sdr_log(3, "$LOG,%.3f,SPP_SEED stat=0 dtr=0.000000000 msg=%s", time, msg);
             update_azel(pvt->nav, pvt->sol, pvt->ssat);
             pvt->sol->ns = 0;
-            sdr_log(3, "$LOG,%.3f,PNTPOS ERROR,%s", time, msg);
         }
     }
     pvt->nsat = pvt->obs->n;
@@ -2111,6 +2114,7 @@ static void update_sol(sdr_pvt_t *pvt)
         sdr_log(3, "$LOG,%.3f,REF_SPP stat=%d dtr=%.9f msg=%s",
             time, ref_sol.stat, ref_sol.dtr[0], ref_stat ? "" : msg);
         if (ref_stat) {
+            s_sc_ref_sol = ref_sol; /* keep for sdr_pvt_solstr() console display */
             double ep[6], pos[3], P[9], Q[9], rdop[4] = {0};
             double dtr_s = ref_sol.dtr[0];
             time2epoch(timeadd(ref_sol.time, dtr_s), ep);
@@ -2303,12 +2307,12 @@ void sdr_pvt_solstr(sdr_pvt_t *pvt, char *buff, int size)
     tstr[4] = tstr[7] = '-';
     snprintf(nstr, sizeof(nstr), "%d/%d", pvt->sol->ns, pvt->nsat);
 
-    if (sdr_ps_sc_mode && s_sc_ref_rtk) {
+    if (sdr_ps_sc_mode && (s_sc_ref_rtk || norm(s_sc_ref_sol.rr, 3) > 1e-6)) {
         /* ps_sc mode: show AOWR-corrected (SC) and uncorrected (REF) solutions */
         char rtstr[32] = "", rnstr[16] = "";
         double rpos[3] = {0};
         int rstat = 0;
-        const sol_t *rsol = &s_sc_ref_rtk->sol;
+        const sol_t *rsol = s_sc_ref_rtk ? &s_sc_ref_rtk->sol : &s_sc_ref_sol;
         if (norm(rsol->rr, 3) > 1e-6) {
             time2str(rsol->time, rtstr, 1);
             ecef2pos(rsol->rr, rpos);
