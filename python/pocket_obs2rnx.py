@@ -35,6 +35,13 @@ _WGS84_E2 = 2 / 298.257223563 - (1 / 298.257223563) ** 2
 # Map first char of sat ID → RINEX 3 system code
 SYS_CHAR = {'G': 'G', 'R': 'R', 'E': 'E', 'J': 'J', 'C': 'C', 'S': 'S'}
 
+# PocketSDR's own AOWR pseudo-satellite (-ps_prn, typically 159 -> RINEX "S59")
+# is a ground-transmitter range, not a real SBAS satellite -- feeding it to a
+# standard RTK tool as if it were one blows up the point-position chi-square
+# test (it doesn't fit any real satellite geometry) and can silently kill
+# every epoch's solution. Excluded by default; override with --excl-sat ''.
+DEFAULT_EXCL_SATS = {'S59', 'S60'}
+
 # Preferred obs-type order within a system (only types present in data appear)
 OBS_ORDER = ['C1C','L1C','D1C','S1C',
              'C1P','L1P','D1P','S1P',
@@ -137,7 +144,7 @@ def fmt_obs(val, lli=0, snr_ind=0, is_phase=False):
 
 # ── epoch grouping ─────────────────────────────────────────────────────────────
 
-def group_epochs(obs_records, sys_filter):
+def group_epochs(obs_records, sys_filter, excl_sats=DEFAULT_EXCL_SATS):
     """Group obs_records by epoch and satellite.
 
     Returns:
@@ -153,6 +160,8 @@ def group_epochs(obs_records, sys_filter):
         if sys_filter and sys_ch not in sys_filter:
             continue
         if sys_ch not in SYS_CHAR:
+            continue
+        if r['sat'] in excl_sats:
             continue
         if r['P'] == 0.0 and r['L'] == 0.0:
             continue
@@ -309,10 +318,16 @@ def main():
                     help='comma-separated satellite systems to include, e.g. G,J (default: all)')
     ap.add_argument('--marker', default='ROVER',
                     help='RINEX MARKER NAME (default: ROVER)')
+    ap.add_argument('--excl-sat', default='S59,S60',
+                    help="comma-separated satellite IDs to exclude (default: "
+                         "S59, PocketSDR's own AOWR pseudo-satellite -- not a "
+                         "real satellite, breaks standard RTK tools if left in; "
+                         "pass '' to disable exclusion)")
     args = ap.parse_args()
 
     out_path = args.out or os.path.splitext(args.logfile)[0] + '.obs'
     sys_filter = set(args.sys.upper().split(',')) if args.sys else None
+    excl_sats = set(args.excl_sat.upper().split(',')) if args.excl_sat else set()
 
     print(f'Reading {args.logfile} ...', end='', flush=True)
     obs_records, pos_xyz = parse_log(args.logfile)
@@ -322,7 +337,7 @@ def main():
         print('No $OBS records found.', file=sys.stderr)
         sys.exit(1)
 
-    epochs, all_types = group_epochs(obs_records, sys_filter)
+    epochs, all_types = group_epochs(obs_records, sys_filter, excl_sats)
     if not epochs:
         print('No valid observations after filtering.', file=sys.stderr)
         sys.exit(1)

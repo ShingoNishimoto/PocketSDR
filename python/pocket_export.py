@@ -267,6 +267,18 @@ def gpst_str(r):
     return (f"{dt.year}-{dt.month:02d}-{dt.day:02d}"
             f"T{dt.hour:02d}:{dt.minute:02d}:{dt.second + frac:06.3f}")
 
+GPS_EPOCH_TS = datetime(1980, 1, 6, tzinfo=timezone.utc).timestamp()
+
+def gpst_week_tow(r):
+    """GPST calendar fields ($POS/$REFPOS, no leap-second shift) -> (week, tow_s)."""
+    si = int(r['sec'])
+    extra_min, si = divmod(si, 60)
+    dt = (datetime(r['year'], r['month'], r['day'], r['hour'], r['min'], 0,
+                   tzinfo=timezone.utc) + timedelta(minutes=extra_min, seconds=si))
+    total = dt.timestamp() + (r['sec'] - int(r['sec'])) - GPS_EPOCH_TS
+    week = int(total // 604800)
+    return week, total - week * 604800
+
 def llh_to_ecef(lat_deg, lon_deg, hgt_m):
     """WGS84 geodetic (deg, deg, m) → ECEF (m)."""
     lat = np.deg2rad(lat_deg)
@@ -417,6 +429,8 @@ def make_df(rows):
     return pd.DataFrame([{
         't_s':           r['t'],
         'datetime_gpst': gpst_str(r),
+        'gps_week':      (_wt := gpst_week_tow(r))[0],
+        'tow_s':         _wt[1],
         # Geodetic
         'lat_deg':       r['lat'],
         'lon_deg':       r['lon'],

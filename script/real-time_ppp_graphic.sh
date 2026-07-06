@@ -59,5 +59,6 @@ pushd .
 cd $date_str
 python3 ../../python/pocket_pos_plot.py pocket.log --out pos_result.pdf
 python3 ../../python/pocket_export.py pocket.log --all
-python3 ../../python/pocket_obs2rnx.py pocket.log --sys G,J
+python3 ../../python/pocket_obs2rnx.py pocket.log --sys G,J -o rover.obs
+python3 ../../python/pocket_eph2rnx.py pocket.log -o rover.nav
 popd

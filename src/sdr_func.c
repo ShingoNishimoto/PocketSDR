@@ -82,7 +82,7 @@ static const char *log_types[] = { // log types
     "$TIME,", "$POS,", "$ATT,", "$OBS,", "$NAV,", "$SAT,", "$CH,", "$EPH,",
     "$ALM,", "$LOG,", "$AOWR,", "$REFPOS,", NULL
 };
-static int log_mask[16] = {1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1}; // log mask
+static int log_mask[16] = {1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1}; // log mask
 static stream_t *log_str = NULL;  // log stream
 static char log_buff[MAX_LOG_BUFF]; // log buffer
 static int log_buff_p = 0;        // log buffer pointer

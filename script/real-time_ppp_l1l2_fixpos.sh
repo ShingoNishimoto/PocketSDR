@@ -34,11 +34,11 @@ cp $0 $date_str/
 [ -n "$CLK_FILE" ] && cp "$CLK_FILE" $date_str/ 2>/dev/null
 
 ###
-# run
+# run (7 digits in lat lon are enough for 1cm accuracy)
 pocket_trk \
     -c $conffile \
     -sig L1CA,L2CM -prn 1-32,193-202 -rfch 3,4 -f 4 -IQ 2 \
-    -fixpos -35.274478762,149.118792749,580.466 \
+    -fixpos -35.27449270,149.11876140,582.837 \
     -opt $confpath/ppp_l2_opt.ini \
     $(build_nav_args) \
     -log $date_str/pocket.log -nmea /dev/ttyUSB0 \
@@ -50,5 +50,6 @@ pushd .
 cd $date_str
 python3 ../../python/pocket_pos_plot.py pocket.log --out pos_result.pdf
 python3 ../../python/pocket_export.py pocket.log --all
-python3 ../../python/pocket_obs2rnx.py pocket.log
+python3 ../../python/pocket_obs2rnx.py pocket.log -o rover.obs
+python3 ../../python/pocket_eph2rnx.py pocket.log -o rover.nav
 popd

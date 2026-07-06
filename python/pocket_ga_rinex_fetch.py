@@ -119,6 +119,8 @@ def maybe_gunzip(path):
     out_path = path[:-3]
     with gzip.open(path, 'rb') as fin, open(out_path, 'wb') as fout:
         shutil.copyfileobj(fin, fout)
+    os.remove(path)  # drop the .gz -- otherwise a later wildcard glob (e.g. for
+                     # rnx2rtkp) matches both it and out_path as separate files
     return out_path
 
 
