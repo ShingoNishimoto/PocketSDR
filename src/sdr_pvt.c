@@ -1812,6 +1812,23 @@ static void update_sol(sdr_pvt_t *pvt)
             }
             if (pvt->rtk->sol.stat) spp_sol = pvt->rtk->sol;
         }
+        /* PPP clock protection: when RAIM-FDE fails (two simultaneous outlier sats)
+         * but the PPP KF clock is already converged, restore sol.dtr[0] from the KF
+         * state before pppos() runs.  udclk_ppp() reinitialises x[IC] from
+         * sol.dtr[0] every epoch; a wrong SPP dtr shifts x[IC] by tens of km,
+         * causing all pre-fit residuals to exceed maxinno=30m and a permanent
+         * PPPOS NO SOLUTION.  Only apply when not in clock_bias_fixed mode (which
+         * sets dtr[0] from the external AOWR clock, not SPP). */
+        if (!pvt->rtk->sol.stat && !sc_clk_ready) {
+            int np_clk = pvt->rtk->opt.dynamics ? 9 : 3; /* IC(0) = np + 0 */
+            double clk_var = pvt->rtk->P[np_clk + np_clk * pvt->rtk->nx];
+            if (clk_var > 0.0 && clk_var < 100.0) { /* PPP converged: std < 10m */
+                pvt->rtk->sol.dtr[0] = pvt->rtk->x[np_clk] / CLIGHT;
+                sdr_log(3, "$LOG,%.3f,PPP_CLK_PROTECT dtr=%.9f (SPP/RAIM failed, clk_std=%.3f m)",
+                    time, pvt->rtk->sol.dtr[0], sqrt(clk_var));
+            }
+        }
+
         /* In clock_bias_fixed mode, a failed pntpos corrupts sol.rr via diverged
          * Newton iterations.  Restore it to the pre-pntpos seed so the next epoch
          * starts from the same clean position instead of drifting further away. */
