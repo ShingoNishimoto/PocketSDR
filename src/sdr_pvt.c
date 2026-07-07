@@ -1483,6 +1483,7 @@ static void res_obs_amb(obs_t *obs, int sys, uint8_t code, double sec);
 static void update_aowr(double time, gtime_t gtime, double P, double L)
 {
     static const double DT_DEV_THRESH   = 3.0 / CLIGHT; // 10 ns gate
+    static const double T_WARMUP  = 10.0; // skip DLL settling transient (s)
     static const int    DEV_COUNT_THRESH = 100;
     static int     initialized   = 0;
     static int64_t dt_int_s      = 0;
@@ -1521,13 +1522,21 @@ static void update_aowr(double time, gtime_t gtime, double P, double L)
     double dt0 = count > 0 ? (double)dt_int_s + dt0_frac_sum / count : 0.0;
     double dt0_current = dt_current - sdr_ps_dist / CLIGHT - Ci;
 
-    int outlier = (dt_aowr != 0.0) &&
+    /* The DLL's narrow (0.25 Hz) noise bandwidth gives it a ~10-12 s settling
+     * time (2nd-order loop, zeta=0.707) before the code-phase estimate (and
+     * thus P) converges after channel lock. Exclude this transient from the
+     * dt_pr/dt_cp/dt0/cp_thresh statistics so it cannot bias the average. */
+    int warmup = (time - initial_rx) < T_WARMUP;
+
+    int outlier = !warmup && (dt_aowr != 0.0) &&
         (fabs(dt_current - dt_aowr)     > DT_DEV_THRESH ||
          fabs(dt0_current - dt0)        > DT_DEV_THRESH ||
          fabs(dt0 + Ci - dt_aowr_cp)    > cp_thresh     ||
-         (time - initial_rx) > 40.0);
+         (time - initial_rx) > T_WARMUP + 40.0);
 
-    if (outlier) {
+    if (warmup) {
+        // skip stats accumulation during the DLL settling transient
+    } else if (outlier) {
         dev_count++;
         dt_new_frac_sum += dt_current - (double)dt_int_s;
         double dt_new   = (double)dt_int_s + dt_new_frac_sum / dev_count;
@@ -1743,6 +1752,7 @@ static void update_sol(sdr_pvt_t *pvt)
         }
         if (sc_clk_ready) {
             spopt.clock_bias_fixed = 1; /* P/L pre-corrected → 3-unknown solve */
+            pvt->rtk->opt.clock_bias_fixed = 1; /* For PPP */
             pvt->rtk->sol.dtr[0] = clock_est; /* fixed clock bias (seconds) */
         }
         // Pass pvt->rtk->ssat so pntpos sets ssat[sat].vs=1; pppos needs vs=1 to accept obs

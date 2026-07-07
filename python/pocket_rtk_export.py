@@ -100,6 +100,63 @@ def make_df(rows):
     } for r, x, y, z in zip(rows, X, Y, Z)])
 
 
+# ── KML ───────────────────────────────────────────────────────────────────────
+
+# color = KML aabbggrr, matching RTKLIB rtkplot's per-quality convention
+_KML_STYLE = {
+    1: ('FIX',    'ff00ff00'),
+    2: ('FLOAT',  'ff00ffff'),
+    3: ('SBAS',   'ffffff00'),
+    4: ('DGPS',   'ffff00ff'),
+    5: ('SINGLE', 'ff0000ff'),
+    6: ('PPP',    'ffff0000'),
+    7: ('DR',     'ff888888'),
+}
+
+
+def write_kml(rows, path):
+    parts = ['<?xml version="1.0" encoding="UTF-8"?>',
+             '<kml xmlns="http://www.opengis.net/kml/2.2">',
+             '<Document>',
+             '  <name>RTK Position</name>']
+    for label, color in _KML_STYLE.values():
+        parts.append(f'  <Style id="{label}Line"><LineStyle><color>{color}</color>'
+                      f'<width>2</width></LineStyle></Style>')
+        parts.append(f'  <Style id="{label}Dot"><IconStyle><color>{color}</color>'
+                      f'<scale>0.5</scale></IconStyle>'
+                      f'<LabelStyle><scale>0</scale></LabelStyle></Style>')
+
+    counts = []
+    for q, (label, _) in _KML_STYLE.items():
+        pts = [r for r in rows if r['q'] == q]
+        if not pts:
+            continue
+        counts.append(f'{len(pts)} {label}')
+        coords = ' '.join(f"{r['lon']},{r['lat']},{r['hgt']}" for r in pts)
+        parts.append('  <Folder>')
+        parts.append(f'    <name>{label} (Q={q}) — {len(pts)} epochs</name>')
+        parts.append(f'    <Placemark><name>{label} Track</name>'
+                      f'<styleUrl>#{label}Line</styleUrl>'
+                      f'<LineString><altitudeMode>absolute</altitudeMode>'
+                      f'<coordinates>{coords}</coordinates></LineString></Placemark>')
+        for r in pts:
+            desc = (f"{r['date']} {r['time']} Q={label} ns={r['ns']} "
+                    f"sdn={r['sdn']:.3f}m sde={r['sde']:.3f}m sdu={r['sdu']:.3f}m "
+                    f"age={r['age']:.1f}s ratio={r['ratio']:.1f}")
+            parts.append(f'    <Placemark><description>{desc}</description>'
+                         f'<styleUrl>#{label}Dot</styleUrl>'
+                         f'<Point><altitudeMode>absolute</altitudeMode>'
+                         f'<coordinates>{r["lon"]},{r["lat"]},{r["hgt"]}</coordinates>'
+                         f'</Point></Placemark>')
+        parts.append('  </Folder>')
+    parts.append('</Document>')
+    parts.append('</kml>')
+
+    with open(path, 'w') as f:
+        f.write('\n'.join(parts))
+    print(f'KML:   {path}  ({", ".join(counts)})')
+
+
 def write_csv(df, path):
     df.to_csv(path, index=False, float_format='%.9g')
     print(f'CSV:   {path}  ({len(df)} rows)')
@@ -122,8 +179,9 @@ def main():
     ap.add_argument('posfile', help='RTKLIB rnx2rtkp .pos file (out-timeform=hms)')
     ap.add_argument('--csv', default=None, help='output CSV path')
     ap.add_argument('--excel', default=None, help='output Excel (.xlsx) path')
+    ap.add_argument('--kml', default=None, help='output KML (Google Earth) path')
     ap.add_argument('--all', action='store_true',
-                    help='write both CSV and Excel, named from posfile stem')
+                    help='write CSV, Excel and KML, named from posfile stem')
     args = ap.parse_args()
 
     rows = parse_rtk_pos(args.posfile)
@@ -137,13 +195,16 @@ def main():
     stem = os.path.splitext(args.posfile)[0]
     csv_path = args.csv or (f'{stem}.csv' if args.all else None)
     excel_path = args.excel or (f'{stem}.xlsx' if args.all else None)
-    if not csv_path and not excel_path:
+    kml_path = args.kml or (f'{stem}.kml' if args.all else None)
+    if not csv_path and not excel_path and not kml_path:
         excel_path = f'{stem}.xlsx'
 
     if csv_path:
         write_csv(df, csv_path)
     if excel_path:
         write_excel(df, excel_path)
+    if kml_path:
+        write_kml(rows, kml_path)
 
     print(f'\n{len(df)} epochs:')
     for q, n in df['quality'].value_counts().sort_index().items():
