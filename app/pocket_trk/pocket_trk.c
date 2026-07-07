@@ -28,6 +28,10 @@
 #include <math.h>
 #include <signal.h>
 #include <ctype.h>
+#ifndef WIN32
+#include <unistd.h>
+#include <sys/ioctl.h>
+#endif
 #include "pocket_sdr.h"
 
 // constants and macros ---------------------------------------------------------
@@ -130,12 +134,29 @@ static void show_usage(void)
     exit(0);
 }
 
+// get terminal width (columns); 0 if unknown (not a tty, or on error) ---------
+static int term_cols(void)
+{
+#ifndef WIN32
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
+        return ws.ws_col;
+    }
+#endif
+    return 0; // unknown: assume no line-wrapping
+}
+
 // print receiver status -------------------------------------------------------
+// nrow/return value are physical terminal rows (not logical '\n'-delimited
+// lines): a status line wider than the terminal wraps onto extra physical
+// rows, and the cursor-up escape below must account for that or a stale
+// wrapped remainder from the previous frame is left un-overwritten (visible
+// as a duplicated line, e.g. two "SC" rows in -ps_sc mode's wide status line).
 static int print_rcv_stat(sdr_rcv_t *rcv, int nrow, int max_row)
 {
     static char stat[(NUM_COL+10)*MAX_ROW];
     char *p, *q;
-    int n = 0;
+    int n = 0, nphys = 0, cols = term_cols();
 
     if (nrow > 0) {
         printf("\033[%dA\r", nrow);
@@ -144,22 +165,25 @@ static int print_rcv_stat(sdr_rcv_t *rcv, int nrow, int max_row)
     }
     // get SDR receiver channel status
     (void)sdr_rcv_ch_stat(rcv, "ALL", 0, MIN_LOCK, 0, 0, stat, sizeof(stat));
-    
+
     for (p = q = stat; (q = strchr(p, '\n')); p = q + 1) {
+        int len = (int)(q - p);
         if (n < max_row) {
-            printf("%s%.*s%s%s\n", n < 2 ? "" : ESC_COL, (int)(q - p), p,
+            printf("%s%.*s%s%s\n", n < 2 ? "" : ESC_COL, len, p,
                 ESC_EOL, ESC_RES);
             n++;
+            nphys += cols > 0 && len > cols ? (len + cols - 1) / cols : 1;
         } else if (n == max_row) {
             printf("... ..%s\n", ESC_EOL);
             n++;
+            nphys++;
         }
     }
-    for ( ; n < nrow; n++) {
+    for ( ; nphys < nrow; nphys++) {
         printf("%s\n", ESC_EOL);
     }
     fflush(stdout);
-    return n;
+    return nphys;
 }
 
 // main ------------------------------------------------------------------------
