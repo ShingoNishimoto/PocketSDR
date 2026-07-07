@@ -2083,15 +2083,22 @@ static void update_sol(sdr_pvt_t *pvt)
             update_azel(pvt->nav, pvt->sol, pvt->ssat);
             pvt->sol->ns = 0;
             sdr_log(3, "$LOG,%.3f,PNTPOS SUPPRESSED (SC no clock)", time);
-        } else if (pntpos(obs, nobs, pvt->nav, &opt, pvt->sol, NULL, pvt->ssat, msg)) {
-            sdr_log(3, "$LOG,%.3f,SPP_SEED stat=%d dtr=%.9f msg=ok",
-                time, pvt->sol->stat, pvt->sol->dtr[0]);
-            if (sc_clk_ready) pvt->sol->dtr[5] = s_sc_clock_drift;
-            output_sol(pvt, time);
         } else {
-            sdr_log(3, "$LOG,%.3f,SPP_SEED stat=0 dtr=0.000000000 msg=%s", time, msg);
-            update_azel(pvt->nav, pvt->sol, pvt->ssat);
-            pvt->sol->ns = 0;
+            /* With clock_bias_fixed=1, pntpos fixes its internal clock state to
+             * sol->dtr[0]*CLIGHT.  Must be set to clock_est (s) before the call;
+             * without this x[3]=0 and residuals are off by ~clock_est*c (~3350 km). */
+            if (sc_clk_ready) pvt->sol->dtr[0] = clock_est;
+
+            if (pntpos(obs, nobs, pvt->nav, &opt, pvt->sol, NULL, pvt->ssat, msg)) {
+                sdr_log(3, "$LOG,%.3f,SPP_SEED stat=%d dtr=%.9f msg=ok",
+                    time, pvt->sol->stat, pvt->sol->dtr[0]);
+                if (sc_clk_ready) pvt->sol->dtr[5] = s_sc_clock_drift;
+                output_sol(pvt, time);
+            } else {
+                sdr_log(3, "$LOG,%.3f,SPP_SEED stat=0 dtr=0.000000000 msg=%s", time, msg);
+                update_azel(pvt->nav, pvt->sol, pvt->ssat);
+                pvt->sol->ns = 0;
+            }
         }
     }
     pvt->nsat = pvt->obs->n;
@@ -2307,7 +2314,7 @@ void sdr_pvt_solstr(sdr_pvt_t *pvt, char *buff, int size)
     tstr[4] = tstr[7] = '-';
     snprintf(nstr, sizeof(nstr), "%d/%d", pvt->sol->ns, pvt->nsat);
 
-    if (sdr_ps_sc_mode && (s_sc_ref_rtk || norm(s_sc_ref_sol.rr, 3) > 1e-6)) {
+    if (sdr_ps_sc_mode) {
         /* ps_sc mode: show AOWR-corrected (SC) and uncorrected (REF) solutions */
         char rtstr[32] = "", rnstr[16] = "";
         double rpos[3] = {0};
