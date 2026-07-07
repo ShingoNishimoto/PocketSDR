@@ -1483,7 +1483,7 @@ static void res_obs_amb(obs_t *obs, int sys, uint8_t code, double sec);
 static void update_aowr(double time, gtime_t gtime, double P, double L)
 {
     static const double DT_DEV_THRESH   = 3.0 / CLIGHT; // 10 ns gate
-    static const double T_WARMUP  = 10.0; // skip DLL settling transient (s)
+    static const double T_WARMUP  = 20.0; // skip DLL settling transient (s)
     static const int    DEV_COUNT_THRESH = 100;
     static int     initialized   = 0;
     static int64_t dt_int_s      = 0;
