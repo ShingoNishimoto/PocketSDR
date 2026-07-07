@@ -1942,6 +1942,7 @@ void sdr_rcv_setopt(const char *opt, double value)
     extern double sdr_fixpos[3];
     extern int sdr_bump_jump, sdr_ionoopt, sdr_pmode, sdr_dynamics;
     extern double sdr_prnaccelh, sdr_prnaccv;
+    extern int sdr_dopvel;
     extern int sdr_ps_prn;
     extern double sdr_ps_dist, sdr_ps_freq_err;
     extern int sdr_ps_gs_mode;
@@ -1976,6 +1977,7 @@ void sdr_rcv_setopt(const char *opt, double value)
     else if (!strcmp(opt, "dynamics"   )) sdr_dynamics    = (int)value;
     else if (!strcmp(opt, "prnaccelh"  )) sdr_prnaccelh   = value;
     else if (!strcmp(opt, "prnaccv"    )) sdr_prnaccv     = value;
+    else if (!strcmp(opt, "dopvel"     )) sdr_dopvel      = (int)value;
     else if (!strcmp(opt, "ps_prn"      )) sdr_ps_prn       = (int)value;
     else if (!strcmp(opt, "ps_dist"     )) sdr_ps_dist      = value;
     else if (!strcmp(opt, "ps_freq_err" )) sdr_ps_freq_err  = value;

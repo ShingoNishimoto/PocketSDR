@@ -1043,6 +1043,7 @@ typedef struct {        /* processing options type */
     int  freqopt;       /* disable L2-AR */
     char pppopt[256];   /* ppp option */
     int  clock_bias_fixed; /* fix receiver clock to known value (SC AOWR mode) */
+    int  dopvel;        /* Doppler-based velocity update in PPP kinematic mode (0:off,1:on) */
 } prcopt_t;
 
 typedef struct {        /* solution options type */

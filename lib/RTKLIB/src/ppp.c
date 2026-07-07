@@ -551,6 +551,34 @@ static void udpos_ppp(rtk_t *rtk)
     }
     free(ix); free(F); free(P); free(FP); free(x); free(xp);
 }
+/* velocity update with Doppler-derived velocity (optional) ------------------
+* aids the velocity states (x[3:6]) with the Doppler-based velocity/covariance
+* that pntpos()'s estvel() already placed in rtk->sol.rr[3:6]/rtk->sol.qv[]
+* earlier this epoch (before pppos() was called). qv[0:3]<=0.0 means estvel()
+* did not converge this epoch (see reset in pntpos()), so skip in that case. */
+static void udvel_dop_ppp(rtk_t *rtk)
+{
+    double v[3],R[9]={0},*H;
+    int i,nx=rtk->nx;
+
+    if (!rtk->opt.dynamics||!rtk->opt.dopvel) return;
+    if (rtk->sol.qv[0]<=0.0||rtk->sol.qv[1]<=0.0||rtk->sol.qv[2]<=0.0) return;
+
+    trace(3,"udvel_dop_ppp:\n");
+
+    H=zeros(nx,3);
+    for (i=0;i<3;i++) {
+        v[i]=rtk->sol.rr[3+i]-rtk->x[3+i];
+        H[3+i+i*nx]=1.0;
+    }
+    R[0]=rtk->sol.qv[0]; R[4]=rtk->sol.qv[1]; R[8]=rtk->sol.qv[2];
+    R[1]=R[3]=rtk->sol.qv[3]; R[5]=R[7]=rtk->sol.qv[4]; R[2]=R[6]=rtk->sol.qv[5];
+
+    if (filter(rtk->x,rtk->P,H,v,R,nx,3)) {
+        trace(2,"udvel_dop_ppp: filter error\n");
+    }
+    free(H);
+}
 /* temporal update of clock --------------------------------------------------*/
 static void udclk_ppp(rtk_t *rtk)
 {
@@ -1127,7 +1155,10 @@ extern void pppos(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
     
     /* temporal update of ekf states */
     udstate_ppp(rtk,obs,n,nav);
-    
+
+    /* velocity update with Doppler-derived velocity (optional) */
+    udvel_dop_ppp(rtk);
+
     /* satellite positions and clocks */
     satposs(obs[0].time,obs,n,nav,rtk->opt.sateph,rs,dts,var,svh);
     

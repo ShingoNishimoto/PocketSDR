@@ -97,6 +97,7 @@ static double s_sc_clock_drift = 0.0;  // WLS clock drift rate (s/s)
 static rtk_t *s_sc_ref_rtk    = NULL; // reference PPP solver (uncorrected obs)
 static sol_t  s_sc_ref_sol     = {0};  // last reference solution (SPP mode; mirror of s_sc_ref_rtk->sol in PPP mode)
 static int    s_spp_fail_n     = 0;    // consecutive SPP_SEED failures in SC clock-fixed mode
+static int    s_ref_spp_fail_n = 0;    // consecutive REF_SPP_SEED failures for s_sc_ref_rtk
 
 /* SC antenna attitude — defined in lib/RTKLIB/src/rtkcmn.c (keeps librtk.a self-contained).
  * Set at startup from the options file; satazel() reads them in the antenna-frame path. */
@@ -107,6 +108,7 @@ extern double sdr_sc_ant_el;    // boresight elevation (deg; -90 = nadir toward 
 int    sdr_dynamics  = 0;      // enable dynamics model for kinematic PPP
 double sdr_prnaccelh = -1.0;   // horizontal acceleration process noise (m/s²), <0 = use RTKLIB default
 double sdr_prnaccv   = -1.0;   // vertical acceleration process noise (m/s²), <0 = use RTKLIB default
+int    sdr_dopvel    = 0;      // enable Doppler-based velocity update in kinematic PPP (0:off,1:on)
 static const int systems[] = {
     SYS_GPS, SYS_GLO, SYS_GAL, SYS_QZS, SYS_CMP, SYS_IRN, SYS_SBS, 0
 };
@@ -966,6 +968,7 @@ sdr_pvt_t *sdr_pvt_new(sdr_rcv_t *rcv)
         opt.dynamics = sdr_dynamics;
         if (sdr_prnaccelh >= 0.0) opt.prn[3] = sdr_prnaccelh;
         if (sdr_prnaccv   >= 0.0) opt.prn[4] = sdr_prnaccv;
+        opt.dopvel = sdr_dopvel;
         if (sdr_pmode == PMODE_PPP_FIXED) {
             opt.ru[0] = sdr_fixpos[0];
             opt.ru[1] = sdr_fixpos[1];
@@ -1836,12 +1839,12 @@ static void update_sol(sdr_pvt_t *pvt)
             }
         }
 
-        // Initialize clock states from pntpos when x[IC]=0.
-        // udclk_ppp() initializes clocks only when norm(x[0:3])=0, but udpos_ppp()
-        // runs first and sets x[0..2] non-zero from sol.rr (seeded by pntpos above).
-        // Without this, x[IC]=0 forever, residuals include the ~15m GPS clock bias,
-        // every measurement is rejected by post-fit, and the KF is permanently frozen.
-        // This replicates what udclk_ppp would have done had udpos_ppp not run first.
+        // Pre-seed clock states so P[IC] is non-zero before pppos.
+        // udclk_ppp() unconditionally resets x[IC]=CLIGHT*sol.dtr[0] (white-noise
+        // clock model), so x[IC] is always written inside pppos regardless.  This
+        // block only matters for P[IC]: after PPP_KF_RESET, P is zeroed, and
+        // udclk_ppp resets P[IC]=VAR_CLK.  The block is therefore redundant but
+        // kept for clarity — it mirrors what udclk_ppp does, before pppos runs.
         {
             int np = pvt->rtk->opt.dynamics ? 9 : 3;
             for (int i = 0; i < NSYS; i++) {
@@ -1889,6 +1892,23 @@ static void update_sol(sdr_pvt_t *pvt)
                    NULL, s_sc_ref_rtk->ssat, msg);
             sdr_log(3, "$LOG,%.3f,REF_SPP_SEED stat=%d dtr=%.9f",
                 time, s_sc_ref_rtk->sol.stat, s_sc_ref_rtk->sol.dtr[0]);
+
+            /* PPP KF reset after consecutive SPP failures, mirroring the main
+             * solver's SC_SPP_FAIL_RESET logic above. Without this, a single bad
+             * SPP fix (e.g. a marginal 4-satellite/high-PDOP solution) permanently
+             * seeds udpos_ppp()'s one-time init with garbage, every subsequent
+             * epoch's residuals get rejected as outliers, and s_sc_ref_rtk never
+             * recovers for the rest of the session. */
+            if (s_sc_ref_rtk->sol.stat) {
+                s_ref_spp_fail_n = 0;
+            } else if (++s_ref_spp_fail_n >= SC_SPP_FAIL_RESET) {
+                int rnx = s_sc_ref_rtk->nx;
+                memset(s_sc_ref_rtk->x, 0, rnx * sizeof(double));
+                memset(s_sc_ref_rtk->P, 0, rnx * rnx * sizeof(double));
+                s_ref_spp_fail_n = 0;
+                sdr_log(3, "$LOG,%.3f,REF_PPP_KF_RESET (SPP failed %d epochs)",
+                    time, SC_SPP_FAIL_RESET);
+            }
 
             // Seed reference clock states when not yet initialized
             {

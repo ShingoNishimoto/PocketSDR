@@ -680,6 +680,9 @@ extern int pntpos(const obsd_t *obs, int n, const nav_t *nav,
     }
     sol->time=obs[0].time;
     sol->dtr[5]=0.0;
+    /* clear velocity covariance so a failed estvel() this epoch can't leave a
+     * stale (previous-epoch) qv for a Doppler-aided consumer to mistake as fresh */
+    sol->qv[0]=sol->qv[1]=sol->qv[2]=sol->qv[3]=sol->qv[4]=sol->qv[5]=0.0f;
     msg[0]='\0';
     
     rs=mat(6,n); dts=mat(2,n); var=mat(1,n); azel_=zeros(2,n); resp=mat(1,n);
