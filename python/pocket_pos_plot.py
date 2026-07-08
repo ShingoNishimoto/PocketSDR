@@ -52,12 +52,12 @@ _DTYPE = [('t','f8'), ('lat','f8'), ('lon','f8'), ('hgt','f8'),
 
 # ── parsing ────────────────────────────────────────────────────────────────────
 
-def _parse_pocket_log(path):
-    """Parse $POS records from a pocket_trk log file."""
+def _parse_pocket_log(path, tag='$POS,'):
+    """Parse $POS (or $REFPOS, same field layout) records from a pocket_trk log."""
     rows = []
     with open(path, errors='replace') as f:
         for line in f:
-            if not line.startswith('$POS,'):
+            if not line.startswith(tag):
                 continue
             p = line.strip().split(',')
             if len(p) < 17:
@@ -122,8 +122,12 @@ def _detect_format(path):
     return 'pocket'
 
 
-def parse_log(path):
-    """Return structured numpy array — auto-detects pocket.log vs RTKLIB .pos."""
+def parse_log(path, tag='$POS,'):
+    """Return structured numpy array — auto-detects pocket.log vs RTKLIB .pos.
+
+    tag selects '$POS,' (main solver, default) or '$REFPOS,' (reference
+    solver) when path is a pocket.log; ignored for RTKLIB .pos files.
+    """
     fmt = _detect_format(path)
     if fmt == 'rtklib':
         data = _parse_rtklib_pos(path)
@@ -131,7 +135,7 @@ def parse_log(path):
             # Normalise t to seconds-from-start (same as pocket.log field p[1])
             data['t'] = data['t'] - data['t'][0]
         return data
-    return _parse_pocket_log(path)
+    return _parse_pocket_log(path, tag)
 
 # ── geodesy ───────────────────────────────────────────────────────────────────
 
@@ -201,8 +205,13 @@ def main():
                     help='include only best-quality epochs: Q=6 (PPP) or Q=1 (RTK-FIX)')
     ap.add_argument('--after', type=float, default=0.0,
                     help='statistics window: seconds after first PPP epoch (default=all)')
-    ap.add_argument('--out', default=None, help='save figure to PNG file')
+    ap.add_argument('--refpos', action='store_true',
+                    help='plot $REFPOS (reference solver) instead of $POS '
+                         '(main solver); ignored for RTKLIB .pos files')
+    ap.add_argument('--out', default=None,
+                    help='save figure to file (.png or .pdf, by extension)')
     args = ap.parse_args()
+    tag = '$REFPOS,' if args.refpos else '$POS,'
 
     # ── resolve reference position ────────────────────────────────────────────
     lat0 = lon0 = hgt0 = None
@@ -225,9 +234,9 @@ def main():
     # ── load data ─────────────────────────────────────────────────────────────
     datasets = []
     for path in args.logfiles:
-        d = parse_log(path)
+        d = parse_log(path, tag)
         if len(d) == 0:
-            print(f'Warning: no $POS records in {path}')
+            print(f'Warning: no {tag.rstrip(",")} records in {path}')
             continue
         if args.ppp_only:
             d = d[(d['q'] == 6) | (d['q'] == 1)]  # PPP or RTK-FIX

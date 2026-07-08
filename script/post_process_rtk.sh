@@ -4,7 +4,8 @@
 # pipeline for one pocket_trk session:
 #   1. rover.obs/rover.nav (offline) + base obs fetch + rnx2rtkp
 #        [pocket_rtk_postproc.py]
-#   2. rtk.pos trajectory sanity-check plot
+#   2. sanity-check plots (PDF): rtk.pos, pocket.log main solver ($POS), and
+#      reference solver ($REFPOS) when present
 #        [pocket_pos_plot.py]
 #   3. onboard main/reference solver vs RTK-truth comparison
 #        [pocket_rtk_compare.py]
@@ -31,7 +32,7 @@ shift
 scriptdir=$(cd "$(dirname "$0")" && pwd)
 pydir=$scriptdir/../python
 
-echo "=== 1/3: RTK post-processing ==="
+echo "=== 1/4: RTK post-processing ==="
 python3 "$pydir/pocket_rtk_postproc.py" "$session_dir" "$@"
 if [ ! -s "$session_dir/rtk.pos" ]; then
     echo "error: $session_dir/rtk.pos was not produced -- aborting" >&2
@@ -39,10 +40,16 @@ if [ ! -s "$session_dir/rtk.pos" ]; then
 fi
 
 echo
-echo "=== 2/3: rtk.pos sanity-check plot ==="
+echo "=== 2/4: sanity-check plots (PDF) ==="
 python3 "$pydir/pocket_pos_plot.py" "$session_dir/rtk.pos" \
-    --out "$session_dir/rtk_check.png" \
+    --out "$session_dir/rtk_check.pdf" \
     || echo "warning: plotting rtk.pos failed (see above); continuing" >&2
+python3 "$pydir/pocket_pos_plot.py" "$session_dir/pocket.log" \
+    --out "$session_dir/pocket_check.pdf" \
+    || echo "warning: plotting pocket.log main solver failed (see above); continuing" >&2
+python3 "$pydir/pocket_pos_plot.py" "$session_dir/pocket.log" --refpos \
+    --out "$session_dir/pocket_ref_check.pdf" \
+    || echo "note: no \$REFPOS (reference solver) records to plot -- normal unless -ps_sc was active" >&2
 
 echo
 echo "=== 3/4: main/reference solver vs RTK truth ==="
@@ -59,9 +66,11 @@ python3 "$pydir/pocket_rtk_export.py" "$session_dir/rtk.pos" \
 
 echo
 echo "Done. Outputs in $session_dir/:"
-echo "  rover.obs, rover.nav   - offline RINEX from pocket.log"
-echo "  rtk.pos                - RTK post-processed trajectory"
-echo "  rtk_check.png          - trajectory sanity-check plot"
-echo "  aowr_compare.png/.csv  - main vs reference solver vs RTK truth"
-echo "  rtk.xlsx               - full rtk.pos position/state history"
-echo "  rtk.kml                - rtk.pos trajectory for Google Earth"
+echo "  rover.obs, rover.nav      - offline RINEX from pocket.log"
+echo "  rtk.pos                   - RTK post-processed trajectory"
+echo "  rtk_check.pdf              - rtk.pos sanity-check plot"
+echo "  pocket_check.pdf           - pocket.log main solver (\$POS) plot"
+echo "  pocket_ref_check.pdf       - pocket.log reference solver (\$REFPOS) plot, if any"
+echo "  aowr_compare.png/.csv     - main vs reference solver vs RTK truth"
+echo "  rtk.xlsx                  - full rtk.pos position/state history"
+echo "  rtk.kml                   - rtk.pos trajectory for Google Earth"

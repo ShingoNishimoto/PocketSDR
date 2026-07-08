@@ -35,6 +35,7 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pocket_export as pe
+import pocket_obs2rnx as obs2rnx
 
 API_BASE = 'https://data.gnss.ga.gov.au/api/rinexFiles'
 NAV_PERIOD = '01D'  # GA only serves nav products at 01D/01H, never 15M
@@ -53,19 +54,60 @@ def row_to_dt(r):
                      tzinfo=timezone.utc) + timedelta(minutes=extra_min, seconds=si))
 
 
+def epoch_to_dt(epoch):
+    """$OBS row's (year,month,day,hour,min,sec) epoch tuple -> datetime,
+    same convention as row_to_dt()."""
+    y, mo, d, h, mi, s = epoch
+    si = int(s)
+    extra_min, si = divmod(si, 60)
+    return (datetime(y, mo, d, h, mi, 0, tzinfo=timezone.utc) +
+            timedelta(minutes=extra_min, seconds=si))
+
+
 def flight_range_from_log(path):
-    """Exact flight start/end from the first and last $POS epoch.
+    """Exact flight start/end -- the union of the $POS range (if any) and the
+    $OBS range, since $OBS is always as wide or wider than $POS.
+
+    RTK post-processing only needs raw observations (+ ephemeris), not a
+    position fix. Two related failure modes this guards against:
+      - $POS completely empty (onboard PVT never converged at all: too few
+        satellites for a real-time fix, cold start, etc.) -- must not block
+        fetching base data just because there's no $POS.
+      - $POS only PARTIALLY covers the session (e.g. the receiver took a few
+        minutes to get its first fix, but was tracking satellites the whole
+        time) -- using $POS's range alone would silently fetch a too-narrow
+        base-data window and leave the pre-fix portion of $OBS unprocessable,
+        even though it's perfectly good raw data once a base station augments
+        it.
 
     The GA API matches by containment (verified live: a query range only
     needs to touch a file's window to include it), so passing the precise
     flight span -- rather than the whole day -- fetches only the 15-min/
     hourly chunks the flight actually needs.
     """
-    rows = pe.parse_log(path)
-    if not rows:
-        print(f'No $POS records found in {path}', file=sys.stderr)
+    pos_rows = pe.parse_log(path)
+    obs_records, _ = obs2rnx.parse_log(path)
+
+    candidates = []
+    if pos_rows:
+        candidates.append((row_to_dt(pos_rows[0]), row_to_dt(pos_rows[-1])))
+    if obs_records:
+        epochs = sorted(r['epoch'] for r in obs_records)
+        candidates.append((epoch_to_dt(epochs[0]), epoch_to_dt(epochs[-1])))
+
+    if not candidates:
+        print(f'No $POS or $OBS records in {path} -- nothing to process.',
+              file=sys.stderr)
         sys.exit(1)
-    return row_to_dt(rows[0]), row_to_dt(rows[-1])
+
+    start = min(c[0] for c in candidates)
+    end = max(c[1] for c in candidates)
+    if pos_rows and obs_records and (start, end) != candidates[0]:
+        print(f'$POS only covers {candidates[0][0]}..{candidates[0][1]} but '
+              f'$OBS spans {candidates[1][0]}..{candidates[1][1]} -- using '
+              'the wider $OBS range so the pre-fix portion is still '
+              'post-processable.', file=sys.stderr)
+    return start, end
 
 
 def whole_day_range(year, month, day):

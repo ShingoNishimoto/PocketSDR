@@ -29,7 +29,8 @@
 #  This script warns if it falls back to whatever "rnx2rtkp" resolves to on
 #  PATH, since that is very likely the broken apt build.
 #
-import sys, os, argparse, subprocess, glob
+import sys, os, re, argparse, subprocess, glob
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pocket_ga_rinex_fetch as fetch
@@ -84,6 +85,54 @@ def existing_base_obs(session_dir):
                   if not p.endswith(('.obs', '.nav')))
 
 
+# GA filenames encode their own coverage window, e.g.
+# STR100AUS_S_20261890015_15M_01S_MO.crx -> year 2026, day-of-year 189,
+# 00:15 start, 15-minute period. Used to detect when *some* base obs file
+# exists but doesn't actually span the rover's full flight window (e.g. only
+# one of two needed 15-min chunks got fetched) -- silently processing with a
+# partial base file produces a large stretch of unreferenced rover epochs,
+# not an error, so this has to be checked explicitly rather than assumed.
+_GA_FNAME_RE = re.compile(r'_(\d{4})(\d{3})(\d{4})_(\d{2})([DHM])_')
+_PERIOD_DUR = {('01', 'D'): timedelta(days=1), ('01', 'H'): timedelta(hours=1),
+               ('15', 'M'): timedelta(minutes=15)}
+
+
+def ga_file_coverage(path):
+    """GA-style RINEX filename -> (start, end) UTC coverage, or None if the
+    name doesn't match (e.g. a manually-supplied file) -- callers treat None
+    as "assume it covers whatever's needed" rather than fail closed."""
+    m = _GA_FNAME_RE.search(os.path.basename(path))
+    if not m:
+        return None
+    year, doy, hhmm, num, unit = m.groups()
+    dur = _PERIOD_DUR.get((num, unit))
+    if dur is None:
+        return None
+    start = (datetime(int(year), 1, 1, tzinfo=timezone.utc) +
+             timedelta(days=int(doy) - 1, hours=int(hhmm[:2]), minutes=int(hhmm[2:])))
+    return start, start + dur
+
+
+def covers_range(paths, start, end):
+    """True if paths' merged GA-filename coverage spans [start, end].
+
+    Files with unparseable names are ignored for the check (assumed fine);
+    if none of the files parse, the check can't be done at all and this
+    conservatively returns False so a fetch is attempted.
+    """
+    windows = sorted(w for w in (ga_file_coverage(p) for p in paths) if w)
+    if not windows:
+        return False
+    merged = [windows[0]]
+    for s, e in windows[1:]:
+        ls, le = merged[-1]
+        if s <= le:
+            merged[-1] = (ls, max(le, e))
+        else:
+            merged.append((s, e))
+    return any(s <= start and e >= end for s, e in merged)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description='Regenerate rover.obs/rover.nav from pocket.log, fetch '
@@ -133,12 +182,20 @@ def main():
 
     print('\n== 3/4: base observations ==')
     base_obs = existing_base_obs(session)
-    if base_obs and not args.skip_fetch:
-        print(f'Found {len(base_obs)} existing base obs file(s) in {session}, '
-              'skipping fetch. Delete them or pass --skip-fetch is implicit '
-              'either way; use a clean dir to force a re-fetch.')
-    elif not args.skip_fetch:
+    if not args.skip_fetch:
         start, end = fetch.flight_range_from_log(log_path)
+    if base_obs and not args.skip_fetch and covers_range(base_obs, start, end):
+        print(f'Existing base obs ({len(base_obs)} file(s)) already cover the '
+              'full flight window; skipping fetch.')
+    elif args.skip_fetch:
+        if base_obs:
+            print(f'Using {len(base_obs)} existing base obs file(s) as-is '
+                  '(--skip-fetch); coverage not checked.')
+    else:
+        if base_obs:
+            print(f'Existing base obs ({len(base_obs)} file(s)) do not fully '
+                  f'cover {start.isoformat()}..{end.isoformat()} -- fetching '
+                  'to fill the gap (existing files are kept, not overwritten).')
         obs_records = fetch.query_api([args.station], start, end, args.period,
                                        ['obs'], '3')
         if not obs_records and args.fallback_station:
