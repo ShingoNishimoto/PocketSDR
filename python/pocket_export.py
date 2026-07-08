@@ -292,7 +292,68 @@ def llh_to_ecef(lat_deg, lon_deg, hgt_m):
 
 # ── KML ───────────────────────────────────────────────────────────────────────
 
-def write_kml(rows, path, label=''):
+# $POS/$REFPOS 'hgt' is WGS-84 *ellipsoidal* height, but Google Earth's
+# <altitudeMode>absolute</altitudeMode> is height above mean sea level (the
+# EGM96 geoid). The two differ by the local geoid undulation N, which is
+# tens of meters and varies slowly with position -- without correcting for
+# it, the KML track sits offset vertically from where it should render.
+_EGM96_GRID_DIRS = ['/usr/share/proj']
+
+
+def _egm96_heights(lat_deg, lon_deg, hgt_ellip_m):
+    """Convert WGS-84 ellipsoidal heights to EGM96 (MSL) heights via PROJ.
+
+    Returns None (caller falls back to uncorrected ellipsoidal height) if
+    pyproj isn't installed or the EGM96 grid can't be found.
+    """
+    try:
+        import pyproj
+    except ImportError:
+        print('warning: pyproj not installed -- KML altitude will use raw '
+              'WGS-84 ellipsoidal height, not EGM96/MSL height. Install '
+              "with 'pip install pyproj' to enable the geoid correction.",
+              file=sys.stderr)
+        return None
+
+    for d in _EGM96_GRID_DIRS:
+        if os.path.isdir(d):
+            pyproj.datadir.append_data_dir(d)
+    pyproj.network.set_network_enabled(False)
+
+    try:
+        t = pyproj.Transformer.from_crs('EPSG:4979', 'EPSG:4326+5773',
+                                         always_xy=True)
+        # sanity check: if the EGM96 grid isn't found, PROJ silently passes
+        # the height through unchanged instead of raising.
+        _, _, h_test = t.transform(0.0, 0.0, 100.0)
+        if abs(h_test - 100.0) < 0.01:
+            print('warning: EGM96 geoid grid not found (looked in '
+                  f'{_EGM96_GRID_DIRS}) -- KML altitude will use raw '
+                  'WGS-84 ellipsoidal height, not EGM96/MSL height.',
+                  file=sys.stderr)
+            return None
+        _, _, hgt_msl = t.transform(lon_deg, lat_deg, hgt_ellip_m)
+    except Exception as e:
+        print(f'warning: EGM96 geoid transform failed ({e}) -- KML altitude '
+              'will use raw WGS-84 ellipsoidal height.', file=sys.stderr)
+        return None
+    return np.asarray(hgt_msl)
+
+
+def write_kml(rows, path, label='', use_geoid=True):
+    if use_geoid and rows:
+        lat = np.array([r['lat'] for r in rows])
+        lon = np.array([r['lon'] for r in rows])
+        hgt = np.array([r['hgt'] for r in rows])
+        hgt_msl = _egm96_heights(lat, lon, hgt)
+        if hgt_msl is not None:
+            rows = [dict(r, hgt=h) for r, h in zip(rows, hgt_msl)]
+            alt_note = 'MSL (EGM96 geoid)'
+        else:
+            alt_note = 'WGS-84 ellipsoidal (EGM96 geoid correction unavailable)'
+    else:
+        alt_note = 'WGS-84 ellipsoidal'
+
     ppp = [r for r in rows if r['q'] == 6]
     spp = [r for r in rows if r['q'] != 6]
     tag = f' ({label})' if label else ''
@@ -323,6 +384,7 @@ def write_kml(rows, path, label=''):
 <kml xmlns="http://www.opengis.net/kml/2.2">
 <Document>
   <name>PocketSDR Position{tag}</name>
+  <description>Altitude reference: {alt_note}</description>
   <Style id="pppLine"><LineStyle><color>ff0000ff</color><width>2</width></LineStyle></Style>
   <Style id="pppDot"><IconStyle><color>ff0000ff</color><scale>0.5</scale></IconStyle>
                     <LabelStyle><scale>0</scale></LabelStyle></Style>
@@ -519,6 +581,10 @@ def main():
     ap.add_argument('logfile', help='pocket.log file')
     ap.add_argument('--all', action='store_true',
                     help='write all formats; names derived from logfile stem')
+    ap.add_argument('--ellipsoidal-height', action='store_true',
+                    help='KML altitude = raw WGS-84 ellipsoidal height '
+                         '(default: convert to EGM96/MSL height via pyproj, '
+                         "matching Google Earth's absolute altitude mode)")
     # Main ($POS) output
     ap.add_argument('--kml',     metavar='FILE')
     ap.add_argument('--gpx',     metavar='FILE')
@@ -601,9 +667,11 @@ def main():
         ap.print_help()
         sys.exit(0)
 
+    use_geoid = not args.ellipsoidal_height
+
     # ── main ($POS) output ──
     if args.all or args.kml:
-        write_kml(rows,     args.kml     or stem + '.kml')
+        write_kml(rows,     args.kml     or stem + '.kml', use_geoid=use_geoid)
     if args.all or args.gpx:
         write_gpx(rows,     args.gpx     or stem + '.gpx')
     if args.all or args.geojson:
@@ -619,7 +687,7 @@ def main():
     if ref_rows:
         if args.all or args.ref_kml:
             write_kml(ref_rows,     args.ref_kml     or ref_stem + '.kml',
-                      label='ref')
+                      label='ref', use_geoid=use_geoid)
         if args.all or args.ref_gpx:
             write_gpx(ref_rows,     args.ref_gpx     or ref_stem + '.gpx',
                       label='ref')

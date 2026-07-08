@@ -113,12 +113,73 @@ _KML_STYLE = {
     7: ('DR',     'ff888888'),
 }
 
+# rnx2rtkp's hgt column is WGS-84 *ellipsoidal* height, but Google Earth's
+# <altitudeMode>absolute</altitudeMode> is height above mean sea level (the
+# EGM96 geoid). The two differ by the local geoid undulation N, which is
+# tens of meters and varies slowly with position -- without correcting for
+# it, the KML track sits offset vertically from where it should render.
+_EGM96_GRID_DIRS = ['/usr/share/proj']
 
-def write_kml(rows, path):
+
+def _egm96_heights(lat_deg, lon_deg, hgt_ellip_m):
+    """Convert WGS-84 ellipsoidal heights to EGM96 (MSL) heights via PROJ.
+
+    Returns None (caller falls back to uncorrected ellipsoidal height) if
+    pyproj isn't installed or the EGM96 grid can't be found.
+    """
+    try:
+        import pyproj
+    except ImportError:
+        print('warning: pyproj not installed -- KML altitude will use raw '
+              'WGS-84 ellipsoidal height, not EGM96/MSL height. Install '
+              "with 'pip install pyproj' to enable the geoid correction.",
+              file=sys.stderr)
+        return None
+
+    for d in _EGM96_GRID_DIRS:
+        if os.path.isdir(d):
+            pyproj.datadir.append_data_dir(d)
+    pyproj.network.set_network_enabled(False)
+
+    try:
+        t = pyproj.Transformer.from_crs('EPSG:4979', 'EPSG:4326+5773',
+                                         always_xy=True)
+        # sanity check: if the EGM96 grid isn't found, PROJ silently passes
+        # the height through unchanged instead of raising.
+        _, _, h_test = t.transform(0.0, 0.0, 100.0)
+        if abs(h_test - 100.0) < 0.01:
+            print('warning: EGM96 geoid grid not found (looked in '
+                  f'{_EGM96_GRID_DIRS}) -- KML altitude will use raw '
+                  'WGS-84 ellipsoidal height, not EGM96/MSL height.',
+                  file=sys.stderr)
+            return None
+        _, _, hgt_msl = t.transform(lon_deg, lat_deg, hgt_ellip_m)
+    except Exception as e:
+        print(f'warning: EGM96 geoid transform failed ({e}) -- KML altitude '
+              'will use raw WGS-84 ellipsoidal height.', file=sys.stderr)
+        return None
+    return np.asarray(hgt_msl)
+
+
+def write_kml(rows, path, use_geoid=True):
+    if use_geoid:
+        lat = np.array([r['lat'] for r in rows])
+        lon = np.array([r['lon'] for r in rows])
+        hgt = np.array([r['hgt'] for r in rows])
+        hgt_msl = _egm96_heights(lat, lon, hgt)
+        if hgt_msl is not None:
+            rows = [dict(r, hgt=h) for r, h in zip(rows, hgt_msl)]
+            alt_note = 'MSL (EGM96 geoid)'
+        else:
+            alt_note = 'WGS-84 ellipsoidal (EGM96 geoid correction unavailable)'
+    else:
+        alt_note = 'WGS-84 ellipsoidal'
+
     parts = ['<?xml version="1.0" encoding="UTF-8"?>',
              '<kml xmlns="http://www.opengis.net/kml/2.2">',
              '<Document>',
-             '  <name>RTK Position</name>']
+             '  <name>RTK Position</name>',
+             f'  <description>Altitude reference: {alt_note}</description>']
     for label, color in _KML_STYLE.values():
         parts.append(f'  <Style id="{label}Line"><LineStyle><color>{color}</color>'
                       f'<width>2</width></LineStyle></Style>')
@@ -180,6 +241,10 @@ def main():
     ap.add_argument('--csv', default=None, help='output CSV path')
     ap.add_argument('--excel', default=None, help='output Excel (.xlsx) path')
     ap.add_argument('--kml', default=None, help='output KML (Google Earth) path')
+    ap.add_argument('--ellipsoidal-height', action='store_true',
+                    help='KML altitude = raw WGS-84 ellipsoidal height '
+                         '(default: convert to EGM96/MSL height via pyproj, '
+                         "matching Google Earth's absolute altitude mode)")
     ap.add_argument('--all', action='store_true',
                     help='write CSV, Excel and KML, named from posfile stem')
     args = ap.parse_args()
@@ -204,7 +269,7 @@ def main():
     if excel_path:
         write_excel(df, excel_path)
     if kml_path:
-        write_kml(rows, kml_path)
+        write_kml(rows, kml_path, use_geoid=not args.ellipsoidal_height)
 
     print(f'\n{len(df)} epochs:')
     for q, n in df['quality'].value_counts().sort_index().items():
