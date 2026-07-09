@@ -1523,6 +1523,7 @@ static void update_aowr(double time, gtime_t gtime, double P, double L)
     static int     dt_new_count     = 0;
     static double  diff_new_total   = 0.0;
     static double  initial_rx    = 0.0;
+    static int     is_complete   = 0;
     double dt_current  = P / CLIGHT;
     double Ci          = L / FREQ1;   // carrier phase in light-seconds
 
@@ -1552,14 +1553,29 @@ static void update_aowr(double time, gtime_t gtime, double P, double L)
      * dt_pr/dt_cp/dt0/cp_thresh statistics so it cannot bias the average. */
     int warmup = (time - initial_rx) < T_WARMUP;
 
-    int outlier = !warmup && (dt_aowr != 0.0) &&
+    /* The averaging window closes T_WARMUP+40s after first lock (see
+     * CLAUDE.md) -- intentional, not a bug: the PS pass is only ~80s and the
+     * tail is noisier. Reaching the cap means accumulation is DONE, not that
+     * every remaining epoch is an outlier: folding it into `outlier` fed
+     * every post-cap epoch into the dev_count/candidate-cluster machinery,
+     * which could reanchor onto noisier tail data past the intended cutoff,
+     * or leave dt_aowr_cp's zero-reseed re-trapped forever with no accepted
+     * epoch left to escape through. Latch a distinct flag instead and freeze
+     * everything once it's set. */
+    if (!is_complete && (time - initial_rx) > T_WARMUP + 40.0) {
+        is_complete = 1;
+    }
+
+    int outlier = !warmup && !is_complete && (dt_aowr != 0.0) &&
         (fabs(dt_current - dt_aowr)     > DT_DEV_THRESH ||
          fabs(dt0_current - dt0)        > DT_DEV_THRESH ||
-         fabs(dt0 + Ci - dt_aowr_cp)    > cp_thresh     ||
-         (time - initial_rx) > T_WARMUP + 40.0);
+         fabs(dt0 + Ci - dt_aowr_cp)    > cp_thresh);
 
-    if (warmup) {
-        // skip stats accumulation during the DLL settling transient
+    if (warmup || is_complete) {
+        // skip stats accumulation: DLL settling transient, or the
+        // averaging window has already closed for this pass -- freeze
+        // dt_aowr/dt_aowr_cp/dt0/count/cp_thresh at their last accepted
+        // values instead of feeding tail-end epochs into outlier detection.
     } else if (outlier) {
         // A fresh streak of consecutive outliers starts a fresh candidate cluster;
         // stale accumulators from a previous (interrupted or failed) streak must
@@ -1605,13 +1621,17 @@ static void update_aowr(double time, gtime_t gtime, double P, double L)
             count            = dt_new_count;
             dt_aowr          = (double)dt_int_s + dt_new_frac_sum / dt_new_count;
             dt_new_count     = 0;
-            /* dt_aowr_cp/cp_thresh/diff_total are carrier-smoothed quantities that
-             * were never tracked for the candidate cluster (only the raw-pseudorange
-             * dt_new_frac_sum was). Clear them so the next accepted (non-outlier)
-             * epoch re-derives dt_aowr_cp = dt0+Ci from scratch against the new
-             * dt0_frac_sum/count, instead of comparing against the stale value from
-             * the cluster we just abandoned. */
-            dt_aowr_cp       = 0.0;
+            /* Seed dt_aowr_cp from the cluster's own dt0_new_frac_sum (already
+             * tracked through the outlier branch) instead of zeroing it. A
+             * zero placeholder combined with a reset (tight) cp_thresh makes
+             * the very next epoch's outlier test (dt0+Ci vs dt_aowr_cp)
+             * guaranteed to fail -- since dt0+Ci is ~1e5 s, not near zero --
+             * which prevents dt_aowr_cp from ever being re-derived, needing
+             * another full DEV_COUNT_THRESH-epoch cluster (~2s at the PS
+             * update rate) to escape the self-inflicted outlier streak.
+             * Seeding it here preserves continuity across the reanchor
+             * instead of discarding it. */
+            dt_aowr_cp       = (double)dt_int_s + dt0_frac_sum / count + Ci;
             diff_total       = 0.0;
             cp_thresh        = 3.0 / CLIGHT;
         }
@@ -1621,9 +1641,10 @@ static void update_aowr(double time, gtime_t gtime, double P, double L)
         diff_new_total   = 0.0;
     }
 
-    // dt_aowr_cp is momentarily 0.0 for the one epoch a reanchor commits on (it is
-    // re-derived from dt0+Ci on the next accepted epoch) -- skip publishing that
-    // placeholder so consumers never see a bogus zero clock offset.
+    // Defensive: dt_aowr_cp is seeded at both commit points (accepted-epoch
+    // branch above and reanchor above), so count > 0 should already imply
+    // dt_aowr_cp != 0.0. Kept as a guard so consumers never see a bogus zero
+    // clock offset if that invariant is ever violated.
     if (sdr_ps_gs_mode && count > 0 && dt_aowr_cp != 0.0) {
         s_gs_last_dt_aowr = dt_aowr_cp;
         s_gs_ps_ever_obs  = 1;
