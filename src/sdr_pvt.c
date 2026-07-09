@@ -31,6 +31,9 @@
 #define MAXDTGLO       (86400.0*7.0) // max age of GLONASS almanac (s)
 #define MAXDTPOS       86400.0   // max age of last fix position (s)
 #define SC_SPP_FAIL_RESET 10     // PPP KF reset after this many consecutive SPP failures in SC mode
+#define SC_PPP_FAIL_RESET 30     // PPP KF reset after this many consecutive non-PPP (stuck at SPP) epochs in SC mode
+                                 // (higher than SC_SPP_FAIL_RESET: PPP convergence is an accumulation process --
+                                 //  ambiguities/ZWD take longer than a single SPP fix, so giving up must be more patient)
 
 #define ROUND(x)   (int)floor((x) + 0.5)
 #define SQRT(x)    ((x) > 0.0 ? sqrt(x) : 0.0)
@@ -98,6 +101,7 @@ static rtk_t *s_sc_ref_rtk    = NULL; // reference PPP solver (uncorrected obs)
 static sol_t  s_sc_ref_sol     = {0};  // last reference solution (SPP mode; mirror of s_sc_ref_rtk->sol in PPP mode)
 static int    s_spp_fail_n     = 0;    // consecutive SPP_SEED failures in SC clock-fixed mode
 static int    s_ref_spp_fail_n = 0;    // consecutive REF_SPP_SEED failures for s_sc_ref_rtk
+static int    s_ppp_fail_n     = 0;    // consecutive non-PPP (stuck at SPP) epochs in SC clock-fixed mode
 
 /* SC antenna attitude — defined in lib/RTKLIB/src/rtkcmn.c (keeps librtk.a self-contained).
  * Set at startup from the options file; satazel() reads them in the antenna-frame path. */
@@ -1964,6 +1968,33 @@ static void update_sol(sdr_pvt_t *pvt)
             }
             if (ndual_pre >= 4) pppos(pvt->rtk, obs, nobs, pvt->nav);
             else sdr_log(3, "$LOG,%.3f,PPPOS SKIPPED (ndual=%d)", time, ndual_pre);
+        }
+
+        /* PPP KF reset after consecutive non-PPP epochs in SC clock-fixed mode.
+         * SPP_SEED (pntpos) succeeding every epoch does not mean pppos() is
+         * making progress: in PMODE_PPP_STATIC, udpos_ppp() (lib/RTKLIB/src/
+         * ppp.c) never re-seeds position after the first epoch -- it only
+         * inflates the position covariance -- so a single early divergence
+         * (e.g. from a still-immature AOWR clock right after PS acquisition,
+         * before drift is estimable) can freeze position/ambiguity states in
+         * a permanently-rejected configuration for the rest of the pass, with
+         * no way to self-correct. The SC_SPP_FAIL_RESET check above never
+         * catches this because it only counts SPP_SEED (pntpos) failures, and
+         * SPP_SEED keeps succeeding the whole time -- only the dual-freq PPP
+         * step is stuck. Applies regardless of static vs kinematic PPP mode:
+         * kinematic-with-dynamics can equally get its velocity/acceleration
+         * states stuck without recovering on its own. */
+        if (sc_clk_ready) {
+            if (pvt->rtk->sol.stat == SOLQ_PPP) {
+                s_ppp_fail_n = 0;
+            } else if (++s_ppp_fail_n >= SC_PPP_FAIL_RESET) {
+                int nx = pvt->rtk->nx;
+                memset(pvt->rtk->x, 0, nx * sizeof(double));
+                memset(pvt->rtk->P, 0, nx * nx * sizeof(double));
+                s_ppp_fail_n = 0;
+                sdr_log(3, "$LOG,%.3f,PPP_KF_RESET (stuck non-PPP %d epochs in SC mode)",
+                    time, SC_PPP_FAIL_RESET);
+            }
         }
         } /* end else (sc_clk_ready) */
 
