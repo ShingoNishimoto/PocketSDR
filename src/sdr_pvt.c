@@ -1112,9 +1112,16 @@ static double gen_prng(gtime_t time, const sdr_ch_t *ch, int use_rx_week)
     double tau = 0.0, tow = time2gpst(time, &week);
 
     if (use_rx_week) {
+        // No +/-302400 fold here: that fold assumes the true value sits near
+        // zero (a real light-time delay), which is right for satellite
+        // ranging but wrong for the AOWR reconstruction offset -- tow_real -
+        // AOWR_tow is legitimately anywhere in [0,604800) depending on time
+        // of day, and folding it would silently corrupt a large-but-correct
+        // positive value into an unrelated negative one. update_aowr()'s own
+        // self-referential fold (anchored to the first observed sample)
+        // handles the one case that genuinely needs correcting: a real GPS
+        // week boundary crossing mid-session.
         tau = tow - ch->tow * 1e-3 + ch->coff;
-        if (tau < -302400.0) tau += 604800.0;
-        if (tau >  302400.0) tau -= 604800.0;
     } else if (ch->week > 0) {
         tau = (week - ch->week) * 86400.0 * 7 + tow - ch->tow * 1e-3 + ch->coff;
     } else if (ch->tow_v == 1) { // tow valid but GPS week not yet decoded from nav
