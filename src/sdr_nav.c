@@ -485,13 +485,19 @@ static void decode_LNAV(sdr_ch_t *ch, const uint8_t *syms, int rev)
         int sf = getbitu(data, 43, 3);
         if (sf == 1) {
             ch->week = getbitu(data, 48, 10) + GPST_OFF_W;
-            /* Validate decoded week against current GPS time. Pseudosatellite
-             * firmware may carry a stale week number hundreds of weeks off,
-             * causing the satellite position to be computed at the wrong GPS
-             * time and the pseudorange to jump by N*604800*c metres.
-             * Replace with the current GPS week if the discrepancy exceeds
-             * 52 weeks (~1 year). */
-            {
+            /* Validate decoded week against current GPS time -- PS/AOWR
+             * pseudo-satellite channel only. That firmware may carry a stale
+             * week number hundreds of weeks off, causing the pseudorange to
+             * jump by N*604800*c metres (see gen_prng()'s use_rx_week).
+             * Real (or simulated) satellite channels must NOT be touched: a
+             * simulator legitimately broadcasting a self-consistent scenario
+             * dated far from "now" needs ch->week to match its own ephemeris
+             * (decoded independently via decode_frame() from the same raw
+             * bits, unaffected by this override) -- forcing ch->week to the
+             * real current week here would desync it from that ephemeris and
+             * make seleph() reject every satellite as stale. */
+            extern int sdr_ps_prn;
+            if (sdr_ps_prn > 0 && ch->prn == sdr_ps_prn && !strcmp(ch->sig, "L1CA")) {
                 int cur_week;
                 time2gpst(utc2gpst(timeget()), &cur_week);
                 if (abs(ch->week - cur_week) > 52) {
