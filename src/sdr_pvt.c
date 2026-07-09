@@ -1083,6 +1083,16 @@ void sdr_pvt_free(sdr_pvt_t *pvt)
 static void init_epoch(sdr_pvt_t *pvt, int64_t ix, sdr_ch_t *ch)
 {
     if (!ch->week) return;
+    // Never seed the receiver's absolute epoch reference from the PS/AOWR
+    // ranging channel -- its week (when it decodes one at all) is not
+    // trustworthy (see gen_prng()'s use_rx_week). In practice a real
+    // satellite always decodes its week first (PS takes ~200s+ vs. <30s for
+    // GPS), but this closes the gap regardless of timing.
+    if (sdr_ps_prn > 0) {
+        char ps_sat_id[16];
+        sdr_sat_id("L1CA", sdr_ps_prn, ps_sat_id);
+        if (!strcmp(ch->sat, ps_sat_id) && !strcmp(ch->sig, "L1CA")) return;
+    }
     double tow = floor(ch->tow * 1e-3 / sdr_epoch) * sdr_epoch + sdr_epoch;
     pvt->time = gpst2time(ch->week, tow);
     pvt->ix = ix + ROUND((tow - ch->tow * 1e-3 - 0.07) / SDR_CYC);
@@ -1090,12 +1100,22 @@ static void init_epoch(sdr_pvt_t *pvt, int64_t ix, sdr_ch_t *ch)
 }
 
 // generate pseudorange --------------------------------------------------------
-static double gen_prng(gtime_t time, const sdr_ch_t *ch)
+// use_rx_week: for the PS/AOWR ranging channel, ch->week decoded from that
+// signal's own nav data is not trustworthy (see update_aowr()'s week-fold
+// comment) -- always reconstruct tau from the receiver's own independently-
+// known GPS week instead, regardless of whether this channel ever decodes
+// (or mis-decodes) a week number of its own. Real satellite channels pass 0
+// and keep the normal ch->week-trusting behavior.
+static double gen_prng(gtime_t time, const sdr_ch_t *ch, int use_rx_week)
 {
     int week;
     double tau = 0.0, tow = time2gpst(time, &week);
-    
-    if (ch->week > 0) {
+
+    if (use_rx_week) {
+        tau = tow - ch->tow * 1e-3 + ch->coff;
+        if (tau < -302400.0) tau += 604800.0;
+        if (tau >  302400.0) tau -= 604800.0;
+    } else if (ch->week > 0) {
         tau = (week - ch->week) * 86400.0 * 7 + tow - ch->tow * 1e-3 + ch->coff;
     } else if (ch->tow_v == 1) { // tow valid but GPS week not yet decoded from nav
         // use current GPS week from receiver time; handle end-of-week wrap
@@ -1110,7 +1130,7 @@ static double gen_prng(gtime_t time, const sdr_ch_t *ch)
     // for debug
     trace(3, "%s %-5s %3d %4d %10.3f %10.3f %12.9f %12.9f\n", ch->sat, ch->sig,
         ch->prn, ch->week, tow, ch->tow * 1e-3, ch->coff, tau);
-    
+
     return CLIGHT * (tau + 0.5 * ch->T * ch->fd / ch->fc);
 }
 
@@ -1145,7 +1165,7 @@ static double gen_cphas(const sdr_ch_t *ch, double P)
 static void update_obs(gtime_t time, obs_t *obs, sdr_ch_t *ch)
 {
     uint8_t code = sig2code(ch->sig);
-    double P = gen_prng(time, ch);
+    double P = gen_prng(time, ch, 0);
     int i, idx = ch->obs_idx, sat;
     
     if (strstr(ch->sat, "R-") || strstr(ch->sat, "R+")) return;
@@ -1233,7 +1253,7 @@ void sdr_pvt_udobs(sdr_pvt_t *pvt, int64_t ix, sdr_ch_t *ch)
             ch->state == SDR_STATE_LOCK && ch->tow >= 0 && ch->tow_v > 0 &&
             (ch->nav->fsync > 0 || ch->trk->sec_sync > 0)) {
             gtime_t gt = timeadd(pvt->time, (ix - pvt->ix) * SDR_CYC);
-            double P = gen_prng(gt, ch);
+            double P = gen_prng(gt, ch, 1); // always use receiver's own week for PS
             double L = gen_cphas(ch, P);
             if (ch->fi != 0.0)         L += ch->fi         * (ch->lock * ch->T);
             if (sdr_ps_freq_err != 0.0) L += sdr_ps_freq_err * (ch->lock * ch->T);
@@ -1499,6 +1519,7 @@ static void update_aowr(double time, gtime_t gtime, double P, double L)
     static double  diff_total    = 0.0;
     static int     dev_count     = 0;
     static double  dt_new_frac_sum  = 0.0;
+    static double  dt0_new_frac_sum = 0.0;
     static int     dt_new_count     = 0;
     static double  diff_new_total   = 0.0;
     static double  initial_rx    = 0.0;
@@ -1540,8 +1561,20 @@ static void update_aowr(double time, gtime_t gtime, double P, double L)
     if (warmup) {
         // skip stats accumulation during the DLL settling transient
     } else if (outlier) {
+        // A fresh streak of consecutive outliers starts a fresh candidate cluster;
+        // stale accumulators from a previous (interrupted or failed) streak must
+        // not leak in, or dt_new_frac_sum/dt0_new_frac_sum end up summed over more
+        // epochs than dev_count divides by, making the "cluster" average nonsense
+        // and preventing dt_new_count from ever reaching DEV_COUNT_THRESH.
+        if (dev_count == 0) {
+            dt_new_frac_sum  = 0.0;
+            dt0_new_frac_sum = 0.0;
+            diff_new_total   = 0.0;
+            dt_new_count     = 0;
+        }
         dev_count++;
-        dt_new_frac_sum += dt_current - (double)dt_int_s;
+        dt_new_frac_sum  += dt_current  - (double)dt_int_s;
+        dt0_new_frac_sum += dt0_current - (double)dt_int_s;
         double dt_new   = (double)dt_int_s + dt_new_frac_sum / dev_count;
         double diff_new = fabs(dt_current - dt_new);
         diff_new_total += diff_new;
@@ -1567,22 +1600,35 @@ static void update_aowr(double time, gtime_t gtime, double P, double L)
 
     if (dev_count >= DEV_COUNT_THRESH) {
         if (dt_new_count >= DEV_COUNT_THRESH) {
-            dt_frac_sum    = dt_new_frac_sum;
-            count          = dt_new_count;
-            dt_aowr        = (double)dt_int_s + dt_new_frac_sum / dt_new_count;
-            dt_new_count   = 0;
-            diff_total     = diff_new_total;
-            diff_new_total = 0.0;
-            cp_thresh      = 3.0 / CLIGHT;
+            dt_frac_sum      = dt_new_frac_sum;
+            dt0_frac_sum     = dt0_new_frac_sum; /* keep dt0 consistent with the new count */
+            count            = dt_new_count;
+            dt_aowr          = (double)dt_int_s + dt_new_frac_sum / dt_new_count;
+            dt_new_count     = 0;
+            /* dt_aowr_cp/cp_thresh/diff_total are carrier-smoothed quantities that
+             * were never tracked for the candidate cluster (only the raw-pseudorange
+             * dt_new_frac_sum was). Clear them so the next accepted (non-outlier)
+             * epoch re-derives dt_aowr_cp = dt0+Ci from scratch against the new
+             * dt0_frac_sum/count, instead of comparing against the stale value from
+             * the cluster we just abandoned. */
+            dt_aowr_cp       = 0.0;
+            diff_total       = 0.0;
+            cp_thresh        = 3.0 / CLIGHT;
         }
-        dev_count = 0;
+        dev_count        = 0;
+        dt_new_frac_sum  = 0.0;
+        dt0_new_frac_sum = 0.0;
+        diff_new_total   = 0.0;
     }
 
-    if (sdr_ps_gs_mode && count > 0) {
+    // dt_aowr_cp is momentarily 0.0 for the one epoch a reanchor commits on (it is
+    // re-derived from dt0+Ci on the next accepted epoch) -- skip publishing that
+    // placeholder so consumers never see a bogus zero clock offset.
+    if (sdr_ps_gs_mode && count > 0 && dt_aowr_cp != 0.0) {
         s_gs_last_dt_aowr = dt_aowr_cp;
         s_gs_ps_ever_obs  = 1;
     }
-    if (sdr_ps_sc_mode && count > 0) {
+    if (sdr_ps_sc_mode && count > 0 && dt_aowr_cp != 0.0) {
         s_sc_last_dt_aowr = dt_aowr_cp;
         s_sc_ps_ever_obs  = 1;
     }
