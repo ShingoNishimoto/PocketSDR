@@ -1176,6 +1176,31 @@ static int test_hold_amb(rtk_t *rtk)
     /* test # of continuous fixed */
     return ++rtk->nfix>=rtk->opt.minfix;
 }
+/* reset outage counter for satellites tracked this epoch ---------------------
+ * udbias_ppp() increments outc[0] every epoch for every satellite;
+ * update_stat() resets it, but only inside the stat==SOLQ_PPP branch above.
+ * During convergence (stat stuck at SOLQ_SINGLE), outc keeps climbing and
+ * phase-bias ambiguities get wiped every maxout epochs even for a satellite
+ * with continuous, healthy observations the whole time (ppp_res() simply
+ * hasn't reached a full accepted solution yet). Left alone, a satellite
+ * excluded during an early convergence/outage window stays excluded
+ * indefinitely even after its observations recover. Must run unconditionally
+ * every call (not just when stat reaches SOLQ_PPP) -- the problem case is
+ * exactly the epochs that never reach SOLQ_PPP in the first place. */
+static void reset_outc_tracked(rtk_t *rtk, const obsd_t *obs, int n)
+{
+    const prcopt_t *opt=&rtk->opt;
+    int i,sat,valid_l1,valid_l2;
+
+    for (i=0;i<n&&i<MAXOBS;i++) {
+        sat=obs[i].sat;
+        valid_l1=obs[i].code[0]&&obs[i].P[0]!=0.0&&obs[i].L[0]!=0.0;
+        valid_l2=opt->nf>1&&obs[i].code[1]&&obs[i].P[1]!=0.0&&obs[i].L[1]!=0.0;
+        if (opt->nf<=1?valid_l1:valid_l2) {
+            rtk->ssat[sat-1].outc[0]=0;
+        }
+    }
+}
 /* precise point positioning -------------------------------------------------*/
 extern void pppos(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
 {
@@ -1265,6 +1290,11 @@ extern void pppos(rtk_t *rtk, const obsd_t *obs, int n, const nav_t *nav)
             rtk->nfix=0;
         }
     }
+    /* unconditional, regardless of whether this epoch reached SOLQ_PPP --
+     * see reset_outc_tracked()'s comment for why it must run outside the
+     * gate above. */
+    reset_outc_tracked(rtk,obs,n);
+
     free(rs); free(dts); free(var); free(azel);
     free(xp); free(Pp); free(v); free(H); free(R);
 }
