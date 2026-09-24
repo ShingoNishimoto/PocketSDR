@@ -2267,18 +2267,11 @@ static void update_sol(sdr_pvt_t *pvt)
                 x_clk, clk_std, zwd, zwd_std, amb_std, nconv, res_c);
         }
 
-        // udbias_ppp() increments outc every epoch; update_stat() resets it but
-        // only when stat==SOLQ_PPP. During convergence (stat=SOLQ_SINGLE), outc
-        // keeps climbing and phase biases are wiped every maxout epochs even for
-        // continuously tracked sats. Reset outc here for any sat with valid L2
-        // obs so genuine outages (sat not in obs this epoch) still trigger resets.
-        for (int i = 0; i < nobs; i++) {
-            int valid_l1 = obs[i].code[0] && obs[i].P[0] != 0.0 && obs[i].L[0] != 0.0;
-            int valid_l2 = obs[i].code[1] && obs[i].P[1] != 0.0 && obs[i].L[1] != 0.0;
-            if ((sdr_ionoopt == IONOOPT_GRAPHIC) ? valid_l1 : valid_l2) {
-                pvt->rtk->ssat[obs[i].sat - 1].outc[0] = 0;
-            }
-        }
+        // outc[0] reset for tracked satellites now happens inside pppos()
+        // itself (reset_outc_tracked() in lib/RTKLIB/src/ppp.c, called
+        // unconditionally regardless of stat) -- covers both this main
+        // solver and the reference solver's pppos() call, so no app-level
+        // duplicate is needed here anymore.
 
         *pvt->sol = pvt->rtk->sol;
         memcpy(pvt->ssat, pvt->rtk->ssat, sizeof(ssat_t) * MAXSAT);

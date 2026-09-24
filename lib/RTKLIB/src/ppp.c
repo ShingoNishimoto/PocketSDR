@@ -1195,8 +1195,8 @@ static void reset_outc_tracked(rtk_t *rtk, const obsd_t *obs, int n)
     for (i=0;i<n&&i<MAXOBS;i++) {
         sat=obs[i].sat;
         valid_l1=obs[i].code[0]&&obs[i].P[0]!=0.0&&obs[i].L[0]!=0.0;
-        valid_l2=opt->nf>1&&obs[i].code[1]&&obs[i].P[1]!=0.0&&obs[i].L[1]!=0.0;
-        if (opt->nf<=1?valid_l1:valid_l2) {
+        valid_l2=obs[i].code[1]&&obs[i].P[1]!=0.0&&obs[i].L[1]!=0.0;
+        if (opt->ionoopt==IONOOPT_GRAPHIC?valid_l1:valid_l2) {
             rtk->ssat[sat-1].outc[0]=0;
         }
     }
