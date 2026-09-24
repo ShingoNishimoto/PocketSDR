@@ -1846,7 +1846,12 @@ static void update_sol(sdr_pvt_t *pvt)
         }
         if (sc_clk_ready) {
             spopt.clock_bias_fixed = 1; /* P/L pre-corrected → 3-unknown solve */
+            spopt.clock_bias_hardfreeze = 1; /* preserve existing (pre-soft-
+                option) real-time behavior exactly -- see clock_bias_hardfreeze
+                in rtklib.h; the soft constraint is unvalidated on real flight
+                data, don't switch the default here without deciding to */
             pvt->rtk->opt.clock_bias_fixed = 1; /* For PPP */
+            pvt->rtk->opt.clock_bias_hardfreeze = 1; /* see spopt above */
             pvt->rtk->sol.dtr[0] = clock_est; /* fixed clock bias (seconds) */
         }
         // Pass pvt->rtk->ssat so pntpos sets ssat[sat].vs=1; pppos needs vs=1 to accept obs
@@ -2306,7 +2311,11 @@ static void update_sol(sdr_pvt_t *pvt)
         opt.elmin   = sdr_el_mask * D2R;
         opt.maxgdop = sdr_maxgdop;
         opt.posopt[4] = 1; // RAIM-FDE
-        if (sc_clk_ready) opt.clock_bias_fixed = 1; /* obs pre-corrected → 3-unknown */
+        if (sc_clk_ready) {
+            opt.clock_bias_fixed = 1; /* obs pre-corrected → 3-unknown */
+            opt.clock_bias_hardfreeze = 1; /* preserve existing real-time
+                behavior -- see the matching comment at spopt above */
+        }
 
         if (sdr_ps_sc_mode && !sc_clk_ready) {
             /* SC mode but no AOWR clock yet: suppress main solution */

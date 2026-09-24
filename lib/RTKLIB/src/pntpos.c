@@ -46,6 +46,10 @@
 #define ERR_CBIAS   0.3         /* code bias error Std (m) */
 #define REL_HUMI    0.7         /* relative humidity for Saastamoinen model */
 #define MIN_EL      (5.0*D2R)   /* min elevation for measurement error (rad) */
+#define VAR_CLK_FIXED_PNT SQR(8.0) /* clock_bias_fixed soft-constraint prior
+                                       variance (m^2) for estpos()'s SPP fit,
+                                       used when clock_bias_fixed_std<=0 --
+                                       see clock_bias_fixed_std override */
 
 /* pseudorange measurement error variance ------------------------------------*/
 static double varerr(const prcopt_t *opt, double el, int sys)
@@ -378,15 +382,26 @@ static int estpos(const obsd_t *obs, int n, const double *rs, const double *dts,
                   const prcopt_t *opt, sol_t *sol, double *azel, int *vsat,
                   double *resp, char *msg)
 {
-    double x[NX]={0},dx[NX],Q[NX*NX],*v,*H,*var,sig;
-    int i,j,k,info,stat,nv,ns,nx;
+    double x[NX]={0},dx[NX],Q[NX*NX],*v,*H,*var,sig,dtr0;
+    int i,j,k,info,stat,nv,ns,nx,clk_soft;
 
     trace(3,"estpos  : n=%d\n",n);
 
-    /* nx=3 when clock is externally known (SC AOWR mode): solve position only */
-    nx=opt->clock_bias_fixed?3:NX;
+    /* nx=3 (position-only, zero clock DoF) only under a true hard freeze
+     * (clock_bias_hardfreeze). clock_bias_fixed WITHOUT clock_bias_hardfreeze
+     * instead pins x[3] toward the externally-supplied clock with a tight
+     * prior (see clk_soft below) so genuine geometry can still nudge it a
+     * little, rather than forcing 100% of any external-clock/ephemeris-datum
+     * mismatch into position and per-satellite residuals -- matches the
+     * default (soft) behavior of clock_bias_fixed in ppp.c's udclk_ppp()/
+     * ppp_res(). clock_bias_hardfreeze keeps the original hard-freeze
+     * behavior available for back-to-back comparison. */
+    nx=(opt->clock_bias_fixed&&opt->clock_bias_hardfreeze)?3:NX;
+    clk_soft=opt->clock_bias_fixed&&!opt->clock_bias_hardfreeze;
 
-    v=mat(n+4,1); H=mat(NX,n+4); var=mat(n+4,1);
+    /* +1 row of headroom vs the original n+4 for the soft-constraint prior
+     * pseudo-observation added below (harmless/unused in the other cases). */
+    v=mat(n+5,1); H=mat(NX,n+5); var=mat(n+5,1);
 
     for (i=0;i<3;i++) x[i]=sol->rr[i];
 
@@ -404,6 +419,10 @@ static int estpos(const obsd_t *obs, int n, const double *rs, const double *dts,
             x[7]=sol->dtr[4];
         }
     }
+    /* fixed target for the soft prior below, captured once in x[]'s internal
+     * (meters) convention -- must NOT be re-read from x[3] inside the loop,
+     * since x[3] is the very state the prior is supposed to hold near. */
+    dtr0=x[3];
 
     for (i=0;i<MAXITR;i++) {
 
@@ -415,13 +434,23 @@ static int estpos(const obsd_t *obs, int n, const double *rs, const double *dts,
             sprintf(msg,"lack of valid sats ns=%d",nv);
             break;
         }
+        /* soft clock_bias_fixed: pin x[3] toward dtr0 with a tight prior
+         * variance instead of excluding it from the state vector entirely --
+         * see ppp.c's matching H[IC]=1 change for the PPP-side equivalent. */
+        if (clk_soft) {
+            v[nv]=dtr0-x[3];
+            for (j=0;j<NX;j++) H[j+nv*NX]=(j==3)?1.0:0.0;
+            var[nv]=opt->clock_bias_fixed_std>0.0?SQR(opt->clock_bias_fixed_std)
+                                                  :VAR_CLK_FIXED_PNT;
+            nv++;
+        }
         /* weighted by Std */
         for (j=0;j<nv;j++) {
             sig=sqrt(var[j]);
             v[j]/=sig;
             for (k=0;k<NX;k++) H[k+j*NX]/=sig;
         }
-        if (opt->clock_bias_fixed) {
+        if (nx==3) {
             /* 3-unknown LSQ: extract position rows (H stride NX→nx) */
             double *Hc=mat(nx,nv),*Qc=mat(nx,nx),*dxc=mat(nx,1);
             for (j=0;j<nv;j++) for (k=0;k<nx;k++) Hc[k+j*nx]=H[k+j*NX];
@@ -462,11 +491,28 @@ static int estpos(const obsd_t *obs, int n, const double *rs, const double *dts,
             if (norm(dx,NX)<1E-4) {
                 sol->type=0;
                 sol->time=timeadd(obs[0].time,-x[3]/CLIGHT);
-                sol->dtr[0]=x[3]/CLIGHT; /* receiver clock bias (s) */
-                sol->dtr[1]=x[4]/CLIGHT; /* GLO-GPS time offset (s) */
-                sol->dtr[2]=x[5]/CLIGHT; /* GAL-GPS time offset (s) */
-                sol->dtr[3]=x[6]/CLIGHT; /* BDS-GPS time offset (s) */
-                sol->dtr[4]=x[7]/CLIGHT; /* IRN-GPS time offset (s) */
+                if (clk_soft) {
+                    /* soft-constrained: x[3..] is genuinely re-estimated
+                     * each epoch (not held at the caller's original value),
+                     * so capture the refined clock rather than leaving
+                     * sol->dtr untouched -- convert back to the caller's
+                     * unit convention, mirroring the seed above. */
+                    if (opt->mode==PMODE_SINGLE) {
+                        sol->dtr[0]=x[3]/CLIGHT; sol->dtr[1]=x[4]/CLIGHT;
+                        sol->dtr[2]=x[5]/CLIGHT; sol->dtr[3]=x[6]/CLIGHT;
+                        sol->dtr[4]=x[7]/CLIGHT;
+                    } else {
+                        sol->dtr[0]=x[3]; sol->dtr[1]=x[4];
+                        sol->dtr[2]=x[5]; sol->dtr[3]=x[6];
+                        sol->dtr[4]=x[7];
+                    }
+                } else {
+                    sol->dtr[0]=x[3]/CLIGHT; /* receiver clock bias (s) */
+                    sol->dtr[1]=x[4]/CLIGHT; /* GLO-GPS time offset (s) */
+                    sol->dtr[2]=x[5]/CLIGHT; /* GAL-GPS time offset (s) */
+                    sol->dtr[3]=x[6]/CLIGHT; /* BDS-GPS time offset (s) */
+                    sol->dtr[4]=x[7]/CLIGHT; /* IRN-GPS time offset (s) */
+                }
                 for (j=0;j<6;j++) sol->rr[j]=j<3?x[j]:0.0;
                 for (j=0;j<3;j++) sol->qr[j]=(float)Q[j+j*NX];
                 sol->qr[3]=(float)Q[1];    /* cov xy */

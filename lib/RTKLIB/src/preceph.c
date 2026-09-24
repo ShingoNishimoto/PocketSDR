@@ -57,6 +57,28 @@
 #define MAXDTE      900.0           /* max time difference to ephem time (s) */
 #define EXTERR_CLK  1E-3            /* extrapolation error for clock (m/s) */
 #define EXTERR_EPH  5E-7            /* extrapolation error for ephem (m/s^2) */
+#define VAR_PRECEPH_FLOOR SQR(2.4)  /* fallback var (m^2) for peph2pos() when
+                                        the SP3/CLK product supplies no
+                                        per-epoch accuracy (no EP records, no
+                                        CLK sigma field -- common for MGEX
+                                        rapid/final products): std[] stays at
+                                        its initialized 0.0, so *var silently
+                                        comes out as exactly 0 instead of
+                                        missing/unknown. That makes
+                                        ppp_res()'s post-fit outlier gate far
+                                        tighter under precise ephemeris than
+                                        under broadcast (var_uraeph() in
+                                        ephemeris.c, always >=SQR(2.4) for a
+                                        healthy satellite) -- small,
+                                        unremarkable residuals can trigger
+                                        rejection purely because the assigned
+                                        variance was ~0, not because the
+                                        observation was actually worse.
+                                        SQR(2.4) matches broadcast's own
+                                        best-case (URA index 0) floor, so
+                                        precise ephemeris is never penalized
+                                        *more* tightly than a healthy
+                                        broadcast satellite would be. */
 
 /* satellite code to satellite system ----------------------------------------*/
 static int code2sys(char code)
@@ -686,7 +708,14 @@ extern int peph2pos(gtime_t time, int sat, const nav_t *nav, int opt,
     else { /* no precise clock */
         dts[0]=dts[1]=0.0;
     }
-    if (var) *var=vare+varc;
-    
+    /* floor as a MINIMUM, not a binary either/or: EXTERR_EPH/EXTERR_CLK's
+     * interpolation-distance penalty terms are real and grow with distance
+     * from the nearest SP3/CLK sample, but on top of an unpopulated (0.0)
+     * product-supplied std[] baseline they stay small through most of the
+     * interpolation window -- MAX() means the floor dominates everywhere the
+     * product doesn't supply real accuracy data, without suppressing a
+     * genuinely larger extrapolation penalty or product-supplied sigma. */
+    if (var) *var=(vare+varc>VAR_PRECEPH_FLOOR)?vare+varc:VAR_PRECEPH_FLOOR;
+
     return 1;
 }

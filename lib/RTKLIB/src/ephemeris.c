@@ -783,7 +783,20 @@ extern int satpos(gtime_t time, gtime_t teph, int sat, int ephopt,
         case EPHOPT_SSRAPC: return satpos_ssr (time,teph,sat,nav, 0,rs,dts,var,svh);
         case EPHOPT_SSRCOM: return satpos_ssr (time,teph,sat,nav, 1,rs,dts,var,svh);
         case EPHOPT_PREC  :
-            if (!peph2pos(time,sat,nav,1,rs,dts,var)) break; else return 1;
+            if (peph2pos(time,sat,nav,1,rs,dts,var)) return 1;
+            /* Fall back to broadcast ephemeris for satellites absent from
+             * the precise product instead of dropping them outright. Some
+             * constellations (e.g. QZSS) are missing from many MGEX
+             * ultra-rapid/rapid products entirely, which would otherwise
+             * silently exclude every satellite of that system for the
+             * whole session whenever EPHOPT_PREC is active. */
+            {
+                int fb=ephpos(time,teph,sat,nav,-1,rs,dts,var,svh);
+                trace(2,"satpos: precise ephem unavailable, fell back to "
+                      "broadcast %s sat=%2d brdc_ok=%d\n",
+                      time_str(time,3),sat,fb);
+                return fb;
+            }
     }
     *svh=-1;
     return 0;

@@ -1043,6 +1043,16 @@ typedef struct {        /* processing options type */
     int  freqopt;       /* disable L2-AR */
     char pppopt[256];   /* ppp option */
     int  clock_bias_fixed; /* fix receiver clock to known value (SC AOWR mode) */
+    int  clock_bias_hardfreeze; /* clock_bias_fixed clock is a true hard
+                                    freeze (zero DoF) instead of the default
+                                    soft constraint (tight prior around the
+                                    externally-supplied value) -- see
+                                    udclk_ppp()/ppp_res() in ppp.c and
+                                    estpos() in pntpos.c. Only meaningful
+                                    when clock_bias_fixed is also set. */
+    double clock_bias_fixed_std; /* clock_bias_fixed prior std (m); <=0 means
+                                    use the built-in 8 m default (VAR_CLK_FIXED
+                                    in ppp.c / VAR_CLK_FIXED_PNT in pntpos.c) */
     int  dopvel;        /* Doppler-based velocity update in PPP kinematic mode (0:off,1:on) */
 } prcopt_t;
 

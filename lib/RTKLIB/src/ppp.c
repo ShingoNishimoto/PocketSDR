@@ -79,6 +79,10 @@
 #define VAR_VEL     SQR(10.0)       /* init variance of receiver vel ((m/s)^2) */
 #define VAR_ACC     SQR(10.0)       /* init variance of receiver acc ((m/ss)^2) */
 #define VAR_CLK     SQR(60.0)       /* init variance receiver clock (m^2) */
+#define VAR_CLK_FIXED SQR(8.0)      /* clock_bias_fixed soft-constraint prior
+                                       variance (m^2), used when
+                                       clock_bias_fixed_std<=0 -- see
+                                       udclk_ppp() */
 #define VAR_ZTD     SQR( 0.6)       /* init variance ztd (m^2) */
 #define VAR_GRA     SQR(0.01)       /* init variance gradient (m^2) */
 #define VAR_DCB     SQR(30.0)       /* init variance dcb (m^2) */
@@ -597,7 +601,25 @@ static void udclk_ppp(rtk_t *rtk)
         else {
             dtr=i==0?rtk->sol.dtr[0]:rtk->sol.dtr[0]+rtk->sol.dtr[i];
         }
-        initx(rtk,CLIGHT*dtr,VAR_CLK,IC(i,&rtk->opt));
+        {
+            double var_clk=VAR_CLK;
+            /* clock_bias_fixed only pins/tightens the PRIMARY (i==0, GPS-
+             * referenced) clock state to the externally-supplied value --
+             * other systems' inter-system-bias states (i>0) keep the
+             * normal wide-open VAR_CLK prior so they stay free to find
+             * their own true ISB each epoch (see the matching k==0
+             * restriction in ppp_res()'s H[IC] gating). Under a true hard
+             * freeze (clock_bias_hardfreeze), H[IC(0)]=0 makes this
+             * variance irrelevant to x[IC(0)]'s actual value regardless of
+             * what it's set to here -- left at VAR_CLK (not tightened) so
+             * the hard-freeze path's reported covariance is numerically
+             * identical to before clock_bias_hardfreeze existed. */
+            if (i==0 && rtk->opt.clock_bias_fixed && !rtk->opt.clock_bias_hardfreeze) {
+                var_clk=rtk->opt.clock_bias_fixed_std>0.0?
+                    SQR(rtk->opt.clock_bias_fixed_std):VAR_CLK_FIXED;
+            }
+            initx(rtk,CLIGHT*dtr,var_clk,IC(i,&rtk->opt));
+        }
     }
 }
 /* temporal update of tropospheric parameters --------------------------------*/
@@ -988,8 +1010,20 @@ static int ppp_res(int post, const obsd_t *obs, int n, const double *rs,
                 default:      k=0; break;
             }
             cdtr=x[IC(k,opt)];
-            if (!opt->clock_bias_fixed) H[IC(k,opt)+nx*nv]=1.0;
-            /* clock_bias_fixed: cdtr used in residual but H[IC]=0, not estimated */
+            /* clock_bias_fixed hard freeze (H[IC]=0, cdtr used in residual
+             * but not estimated) only ever applies to the PRIMARY (k==0,
+             * GPS-referenced) clock state -- other systems' inter-system-
+             * bias states (k>0) stay fully free (H[IC]=1) even under hard
+             * freeze, so genuine ISB (commonly tens of ns to ~1us, i.e.
+             * meters-scale) has somewhere to go instead of being forced
+             * entirely into the outlier gate and rejecting non-GPS
+             * satellites wholesale (see the matching i==0 restriction in
+             * udclk_ppp()). Soft-constrained clock_bias_fixed
+             * (clock_bias_hardfreeze off, the default) always keeps
+             * H[IC]=1 -- see udclk_ppp()'s tight-prior reseed instead of
+             * a hard exclusion here. */
+            if (!(k==0 && opt->clock_bias_fixed && opt->clock_bias_hardfreeze))
+                H[IC(k,opt)+nx*nv]=1.0;
             
             if (opt->tropopt==TROPOPT_EST||opt->tropopt==TROPOPT_ESTG) {
                 for (k=0;k<(opt->tropopt>=TROPOPT_ESTG?3:1);k++) {
@@ -1100,11 +1134,15 @@ static void update_stat(rtk_t *rtk, const obsd_t *obs, int n, int stat)
         rtk->sol.qr[4]=(float)rtk->P[2+rtk->nx];
         rtk->sol.qr[5]=(float)rtk->P[2];
     }
-    if (!rtk->opt.clock_bias_fixed) {
+    /* soft-constrained clock_bias_fixed (clock_bias_hardfreeze off) still
+     * genuinely re-estimates x[IC(*)] each epoch (H[IC]=1 in ppp_res()), so
+     * capture the refined value same as the free-clock case -- only a true
+     * hard freeze (H[IC(0)]=0) leaves x[IC(0)] unable to move, in which
+     * case sol.dtr[0] correctly retains exactly what the caller set it to. */
+    if (!(rtk->opt.clock_bias_fixed && rtk->opt.clock_bias_hardfreeze)) {
         rtk->sol.dtr[0]=rtk->x[IC(0,opt)];
         rtk->sol.dtr[1]=rtk->x[IC(1,opt)]-rtk->x[IC(0,opt)];
     }
-    /* clock_bias_fixed: sol.dtr[0] retains the externally known clock (set by caller) */
     
     for (i=0;i<n&&i<MAXOBS;i++) for (j=0;j<opt->nf;j++) {
         rtk->ssat[obs[i].sat-1].snr[j]=obs[i].SNR[j];
