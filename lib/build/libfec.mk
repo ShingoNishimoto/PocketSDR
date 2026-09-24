@@ -27,19 +27,17 @@ TARGET = libfec.$(EXT) libfec.a
 
 all :
 	DIR=`pwd`; \
-	cd $(SRC); \
-	./configure $(CONF_OPT); \
+	mkdir -p $(SRC)/build; \
+	cd $(SRC)/build; \
+	../configure $(CONF_OPT); \
 	sed 's/-lc//' < makefile > makefile.p; \
 	mv makefile.p makefile; \
 	make; \
 	cd $$DIR; \
-    cp $(SRC)/libfec.a $(SRC)/libfec.$(EXT) .
+    cp $(SRC)/build/libfec.a $(SRC)/build/libfec.$(EXT) .
 
 clean:
-	DIR=`pwd`; \
-	cd $(SRC); \
-	make clean; \
-	cd $$DIR; \
+	rm -rf $(SRC)/build
 	rm -f $(TARGET)
 
 install:

@@ -63,9 +63,18 @@ def _parse_pocket_log(path, tag='$POS,'):
             if len(p) < 17:
                 continue
             try:
+                lat, lon, hgt = float(p[8]), float(p[9]), float(p[10])
+                # A failed pntpos() lsq() solve (singular matrix, e.g. too few
+                # sats) can leave NaN in sol.rr/dtr while still reporting
+                # stat!=0. One NaN row poisons mean()/std() for the whole
+                # file (NaN propagates through the reduction), turning every
+                # stat in the summary to NaN even though the other n-1 rows
+                # are fine -- skip such rows instead.
+                if not all(np.isfinite([lat, lon, hgt])):
+                    continue
                 rows.append((
                     float(p[1]),
-                    float(p[8]), float(p[9]), float(p[10]),
+                    lat, lon, hgt,
                     int(p[11]),  int(p[12]),
                     float(p[13]), float(p[14]), float(p[15]),
                 ))
@@ -210,6 +219,17 @@ def main():
                          '(main solver); ignored for RTKLIB .pos files')
     ap.add_argument('--out', default=None,
                     help='save figure to file (.png or .pdf, by extension)')
+    ap.add_argument('--ne-range', type=float, default=None, metavar='M',
+                    help='clip North/East (error or diff-from-mean) axes to '
+                         '+/-M metres instead of auto-scaling to the data -- '
+                         'use when a single outlier epoch stretches the '
+                         'range and hides the normal-case detail. Also '
+                         'clips both axes of the horizontal scatter plot.')
+    ap.add_argument('--u-range', type=float, default=None, metavar='M',
+                    help='clip the Up (error or diff-from-mean) axis to '
+                         '+/-M metres -- set independently from --ne-range '
+                         'since vertical error is typically a different '
+                         'scale from horizontal.')
     args = ap.parse_args()
     tag = '$REFPOS,' if args.refpos else '$POS,'
 
@@ -361,22 +381,34 @@ def main():
     ax_h.grid(True, ls=':', lw=0.5)
     ax_h.legend(fontsize=7, loc='upper right')
 
-    for ax, ylabel, std_sym in [(ax_n, 'North error (m)', 'σN'),
-                                 (ax_e, 'East error (m)',  'σE'),
-                                 (ax_u, 'Up error (m)',    'σU')]:
+    # "error" is only a meaningful word when --ref/--ahd gave a real, known
+    # ground truth to diff against. Without one, these values are diffs from
+    # the mean of the file's own trajectory (see "have_ref" above) -- for a
+    # genuinely moving (dynamic/kinematic) receiver, that's expected to vary
+    # with real motion, not "error", so the label would be misleading.
+    neu_word = 'error' if have_ref else 'diff from mean'
+
+    for ax, ylabel, std_sym, rng in [(ax_n, f'North {neu_word} (m)', 'σN', args.ne_range),
+                                      (ax_e, f'East {neu_word} (m)',  'σE', args.ne_range),
+                                      (ax_u, f'Up {neu_word} (m)',    'σU', args.u_range)]:
         ax.axhline(0, color='k', lw=0.8, ls='--')
         ax.set_ylabel(ylabel)
         ax.set_xlabel('Time (min)')
         ax.grid(True, ls=':', lw=0.5)
         ax.text(0.01, 0.97, f'shading = ±{std_sym}',
                 transform=ax.transAxes, fontsize=7, va='top', color='gray')
+        if rng is not None:
+            ax.set_ylim(-rng, rng)
 
     ax_ne.axhline(0, color='k', lw=0.5, ls='--')
     ax_ne.axvline(0, color='k', lw=0.5, ls='--')
-    ax_ne.set_xlabel('East error (m)')
-    ax_ne.set_ylabel('North error (m)')
+    ax_ne.set_xlabel(f'East {neu_word} (m)')
+    ax_ne.set_ylabel(f'North {neu_word} (m)')
     ax_ne.set_title('Horizontal scatter')
     ax_ne.grid(True, ls=':', lw=0.5)
+    if args.ne_range is not None:
+        ax_ne.set_xlim(-args.ne_range, args.ne_range)
+        ax_ne.set_ylim(-args.ne_range, args.ne_range)
 
     ax_std.set_xlabel('Time (min)')
     ax_std.set_ylabel('Formal std dev (m)')

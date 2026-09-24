@@ -114,10 +114,30 @@ def main():
                     help='max seconds between truth epochs to interpolate across (default 2.0)')
     ap.add_argument('--csv', default=None, help='write per-epoch comparison CSV')
     ap.add_argument('--out', default=None, help='save figure to PNG instead of displaying')
+    ap.add_argument('--ne-range', type=float, default=None, metavar='M',
+                    help='clip North/East error axes to +/-M metres instead '
+                         'of auto-scaling to the data -- use when a single '
+                         'outlier epoch stretches the range and hides the '
+                         'normal-case detail. Also clips both axes of the '
+                         'horizontal scatter plot.')
+    ap.add_argument('--u-range', type=float, default=None, metavar='M',
+                    help='clip the Up error axis to +/-M metres -- set '
+                         'independently from --ne-range since vertical '
+                         'error is typically a different scale from '
+                         'horizontal.')
+    ap.add_argument('--ref-pos-file', metavar='FILE',
+                    help='use an offline rnx2rtkp .pos file (e.g. standalone '
+                         'PPP post-processing) as the reference-solver data '
+                         'instead of pocket.log\'s own $REFPOS records -- for '
+                         'sessions where the onboard reference solver got '
+                         'stuck (see AOWR PPP KF reset bug in sdr_pvt.c)')
     args = ap.parse_args()
 
     main_rows = pe.parse_log(args.pocket_log)
-    ref_rows  = pe.parse_refpos_log(args.pocket_log)
+    if args.ref_pos_file:
+        ref_rows = pe.parse_rtklib_pos_as_ref(args.ref_pos_file)
+    else:
+        ref_rows = pe.parse_refpos_log(args.pocket_log)
     aowr_hist = pe.parse_sc_aowr_log(args.pocket_log)
 
     if not main_rows:
@@ -217,6 +237,13 @@ def main():
                      label=SOLVER_LABEL['ref'])
     ax_n.legend(fontsize=7); ax_u.set_xlabel('minutes from session start')
     ax_ne.set_xlabel('E err (m)'); ax_ne.set_ylabel('N err (m)')
+    if args.ne_range is not None:
+        ax_n.set_ylim(-args.ne_range, args.ne_range)
+        ax_e.set_ylim(-args.ne_range, args.ne_range)
+        ax_ne.set_xlim(-args.ne_range, args.ne_range)
+        ax_ne.set_ylim(-args.ne_range, args.ne_range)
+    if args.u_range is not None:
+        ax_u.set_ylim(-args.u_range, args.u_range)
     ax_ne.grid(alpha=0.3); ax_ne.legend(fontsize=7)
 
     # AOWR clock offset history (as actually applied to the main solver)
@@ -243,6 +270,10 @@ def main():
     if args.out:
         fig.savefig(args.out, dpi=150)
         print(f'\nFigure: {args.out}')
+        pdf_out = os.path.splitext(args.out)[0] + '.pdf'
+        if pdf_out != args.out:
+            fig.savefig(pdf_out)
+            print(f'Figure: {pdf_out}')
     else:
         plt.show()
 

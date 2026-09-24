@@ -54,7 +54,7 @@ python3 "$pydir/pocket_pos_plot.py" "$session_dir/pocket.log" --refpos \
 echo
 echo "=== 3/4: main/reference solver vs RTK truth ==="
 python3 "$pydir/pocket_rtk_compare.py" "$session_dir/pocket.log" "$session_dir/rtk.pos" \
-    --out "$session_dir/aowr_compare.png" --csv "$session_dir/aowr_compare.csv" \
+    --out "$session_dir/position_compare.png" --csv "$session_dir/position_compare.csv" \
     || echo "warning: pocket_rtk_compare.py failed (see above)" >&2
 
 echo
@@ -71,6 +71,6 @@ echo "  rtk.pos                   - RTK post-processed trajectory"
 echo "  rtk_check.pdf              - rtk.pos sanity-check plot"
 echo "  pocket_check.pdf           - pocket.log main solver (\$POS) plot"
 echo "  pocket_ref_check.pdf       - pocket.log reference solver (\$REFPOS) plot, if any"
-echo "  aowr_compare.png/.csv     - main vs reference solver vs RTK truth"
+echo "  position_compare.png/.pdf/.csv - main vs reference solver vs RTK truth"
 echo "  rtk.xlsx                  - full rtk.pos position/state history"
 echo "  rtk.kml                   - rtk.pos trajectory for Google Earth"

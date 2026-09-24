@@ -86,6 +86,14 @@ def parse_log(path):
                     r['vdop'] = float(p[26])
                 if len(p) >= 28:
                     r['dtr_drift'] = float(p[27])
+                # lsq() in RTKLIB's pntpos() can leave NaN in a failed solve's
+                # sol.dtr[]/rr[] while still reporting stat!=0 (seen live: a
+                # singular normal-equations matrix from too few sats). Such
+                # rows aren't usable position fixes -- skip them here so every
+                # consumer (calendar conversion, plotting, comparison) doesn't
+                # have to separately defend against NaN calendar fields.
+                if not all(np.isfinite([r['sec'], r['lat'], r['lon'], r['hgt'], r['dtr']])):
+                    continue
                 rows.append(r)
             except (ValueError, IndexError):
                 continue
@@ -245,9 +253,147 @@ def parse_refpos_log(path):
                     r['vel_x'] = float(p[22])
                     r['vel_y'] = float(p[23])
                     r['vel_z'] = float(p[24])
+                # See the matching skip in parse_log(): a failed pntpos() lsq()
+                # solve can leave NaN in dtr/rr while stat!=0.
+                if not all(np.isfinite([r['sec'], r['lat'], r['lon'], r['hgt'], r['dtr']])):
+                    continue
                 rows.append(r)
             except (ValueError, IndexError):
                 continue
+    return rows
+
+
+def parse_dtr_debug_log(path):
+    """Parse a DTRDBG debug trace (temporary rtkpos.c instrumentation -- see
+    parse_rtklib_pos_as_ref()) into {datetime: dtr} for the forward pass only.
+
+    Line format: DTRDBG,<gps week>,<gps tow>,<sol.stat>,<sol.dtr[0] in seconds>
+    printed to stderr right after pppos() returns, once per epoch per pass.
+    For pos1-soltype=combined (forward+backward), the trace contains the
+    forward pass first (tow increasing) followed by the backward pass (tow
+    decreasing) -- only the forward-pass run is kept here, because combres()
+    in postpos.c builds the combined output's sols.dtr[0] from solf[i].dtr[0]
+    (the forward pass value is carried through unchanged; only position/
+    covariance get smoothed) whenever forward and backward cover the same
+    epoch, which is the common case for a continuous observation file.
+    """
+    GPS_EPOCH = datetime(1980, 1, 6)
+    out = {}
+    last_tow = -1e18
+    with open(path, errors='replace') as f:
+        for raw in f:
+            for line in raw.split('\r'):
+                line = line.strip()
+                if not line.startswith('DTRDBG,'):
+                    continue
+                p = line.split(',')
+                if len(p) != 5:
+                    continue
+                try:
+                    week, tow, dtr = int(p[1]), float(p[2]), float(p[4])
+                except ValueError:
+                    continue
+                if tow <= last_tow:
+                    break  # backward pass started
+                last_tow = tow
+                dt = GPS_EPOCH + timedelta(seconds=week * 604800 + tow)
+                out[dt] = dtr
+    return out
+
+
+def parse_rtklib_pos_as_ref(path, dtr_debug_path=None):
+    """Return list of dicts, in the same shape as parse_refpos_log(), parsed
+    from an rnx2rtkp RTKLIB .pos file (llh format, out-timeform=hms/out-
+    timesys=gpst -- see conf/rtk_*.conf).
+
+    Used to substitute an offline-reprocessed solution (e.g. standalone PPP
+    post-processing, pos1-posmode=ppp-kine) for the onboard reference
+    solver's own $REFPOS data, when the latter is unusable (e.g. stuck in
+    SPP for most of a session -- see AOWR PPP KF reset bug in sdr_pvt.c).
+
+    dtr_debug_path: optional DTRDBG trace (see parse_dtr_debug_log()) giving
+    the true per-epoch receiver clock bias straight from the KF state,
+    matched to each .pos row by exact GPST timestamp. Without it, dtr is only
+    approximated from the .pos timestamp's own clock-bias-driven sub-second
+    offset (see below) -- that approximation is accurate to just ~1 ms (the
+    .pos file's own timestamp precision, out-timendec=3), nowhere near the
+    ns-level agreement expected between two independent solvers estimating
+    the same physical receiver clock. Verified on 2026-07-15 against a
+    session with a healthy onboard $REFPOS: DTRDBG-sourced dtr agreed with
+    the onboard main solver's independent dtr_s to within ~1e-7 s at the
+    same epoch, vs. ~1e-3 s off (and briefly wrong-signed) for the
+    timestamp-only approximation.
+
+    Caveats vs a genuine $REFPOS row:
+      - Without dtr_debug_path, dtr is reconstructed from the .pos
+        timestamp: pntpos() sets sol->time = timeadd(obs[0].time,
+        -x[3]/CLIGHT) (note the MINUS -- pntpos.c:433/464), and pppos()
+        never touches sol.time afterward (rtkpos.c calls pntpos() to seed
+        rtk->sol before pppos(), and only pntpos assigns sol.time), so the
+        printed timestamp is raw_obs_epoch MINUS the SPP-seed clock bias,
+        i.e. dtr = raw_obs_epoch - reported_time (opposite sign from the
+        onboard $REFPOS timestamp convention, time2epoch(timeadd(rsol->time,
+        rdtr), ep) in sdr_pvt.c, which adds dtr). PocketSDR rover.obs is
+        always sampled on an exact 1 Hz grid, so dtr is recovered from the
+        reported timestamp's sub-second offset from the nearest whole
+        second -- but see the ms-level precision caveat above; prefer
+        dtr_debug_path when available.
+      - 't' (elapsed seconds) is relative to this file's own first epoch,
+        not pocket.log's own elapsed-time clock, since a standalone rnx2rtkp
+        run has no relationship to the onboard process's own start time.
+        Calendar fields (year/month/day/hour/min/sec) are the real GPST time
+        and unaffected by this.
+    """
+    _nan = float('nan')
+    dtr_debug = parse_dtr_debug_log(dtr_debug_path) if dtr_debug_path else None
+    n_debug_miss = 0
+    rows = []
+    t0 = None
+    with open(path, errors='replace') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('%'):
+                continue
+            p = line.split()
+            if len(p) < 10:
+                continue
+            try:
+                dt = datetime.strptime(f'{p[0]} {p[1]}', '%Y/%m/%d %H:%M:%S.%f')
+                if t0 is None:
+                    t0 = dt
+                if dtr_debug is not None:
+                    if dt in dtr_debug:
+                        dtr = dtr_debug[dt]
+                    else:
+                        n_debug_miss += 1
+                        frac = dt.microsecond / 1e6
+                        dtr = -frac if frac <= 0.5 else 1.0 - frac
+                else:
+                    frac = dt.microsecond / 1e6
+                    dtr = -frac if frac <= 0.5 else 1.0 - frac
+                r = {
+                    't':     (dt - t0).total_seconds(),
+                    'year':  dt.year, 'month': dt.month, 'day': dt.day,
+                    'hour':  dt.hour, 'min':   dt.minute,
+                    'sec':   dt.second + dt.microsecond / 1e6,
+                    'lat':   float(p[2]), 'lon': float(p[3]), 'hgt': float(p[4]),
+                    'q':     int(p[5]),   'ns':  int(p[6]),
+                    'stdn':  float(p[7]), 'stde': float(p[8]), 'stdu': float(p[9]),
+                    'dtr':   dtr,  # DTRDBG-sourced if available; else timestamp-approximated
+                }
+                r['ecef_x'], r['ecef_y'], r['ecef_z'] = \
+                    llh_to_ecef(r['lat'], r['lon'], r['hgt'])
+                r['vel_x'] = r['vel_y'] = r['vel_z'] = _nan
+                if not all(np.isfinite([r['sec'], r['lat'], r['lon'], r['hgt']])):
+                    continue
+                rows.append(r)
+            except (ValueError, IndexError):
+                continue
+    if dtr_debug is not None and n_debug_miss:
+        print(f'Warning: {n_debug_miss}/{len(rows)} rows in {path} had no exact '
+              f'DTRDBG timestamp match (fell back to timestamp-approximated dtr '
+              '-- likely backward-pass-only epochs near a data gap)',
+              file=sys.stderr)
     return rows
 
 
@@ -596,6 +742,21 @@ def main():
     ap.add_argument('--ref-gpx',     metavar='FILE')
     ap.add_argument('--ref-geojson', metavar='FILE')
     ap.add_argument('--ref-csv',     metavar='FILE')
+    ap.add_argument('--ref-pos-file', metavar='FILE',
+                    help='use an offline rnx2rtkp .pos file (e.g. standalone '
+                         'PPP post-processing) as the reference-solver data '
+                         'instead of pocket.log\'s own $REFPOS records -- for '
+                         'sessions where the onboard reference solver got '
+                         'stuck (see AOWR PPP KF reset bug in sdr_pvt.c)')
+    ap.add_argument('--ref-dtr-debug', metavar='FILE',
+                    help='DTRDBG debug trace (stderr from a temporarily-'
+                         'instrumented rnx2rtkp -- see parse_dtr_debug_log() '
+                         'docstring) giving true per-epoch receiver clock '
+                         'bias for --ref-pos-file rows. Without this, dtr is '
+                         'only approximated from the .pos timestamp to ~1 ms '
+                         'precision -- use this flag when accurate dtr_s '
+                         'matters (e.g. cross-checking against the main '
+                         "solver's own clock estimate).")
     args = ap.parse_args()
 
     rows = parse_log(args.logfile)
@@ -607,12 +768,21 @@ def main():
     else:
         print(f'No $POS records in {args.logfile}', file=sys.stderr)
 
-    ref_rows = parse_refpos_log(args.logfile)
-    if ref_rows:
-        rppp_n = sum(1 for r in ref_rows if r['q'] == 6)
-        rspp_n = len(ref_rows) - rppp_n
-        print(f'Parsed {len(ref_rows)} $REFPOS records'
-              f'  ({rppp_n} PPP, {rspp_n} SPP)')
+    if args.ref_pos_file:
+        ref_rows = parse_rtklib_pos_as_ref(args.ref_pos_file, args.ref_dtr_debug)
+        if ref_rows:
+            rppp_n = sum(1 for r in ref_rows if r['q'] == 6)
+            rspp_n = len(ref_rows) - rppp_n
+            print(f'Parsed {len(ref_rows)} rows from {args.ref_pos_file} as '
+                  f'reference solver data  ({rppp_n} PPP, {rspp_n} SPP) '
+                  '-- overriding pocket.log $REFPOS')
+    else:
+        ref_rows = parse_refpos_log(args.logfile)
+        if ref_rows:
+            rppp_n = sum(1 for r in ref_rows if r['q'] == 6)
+            rspp_n = len(ref_rows) - rppp_n
+            print(f'Parsed {len(ref_rows)} $REFPOS records'
+                  f'  ({rppp_n} PPP, {rspp_n} SPP)')
 
     if not rows and not ref_rows:
         print('No position records found, exiting.', file=sys.stderr)
@@ -636,11 +806,28 @@ def main():
 
     sc_aowr = parse_sc_aowr_log(args.logfile)
     if sc_aowr:
+        n_reconstructed = 0
         for r in rows:
             if r['t'] in sc_aowr:
                 r['sc_aowr_clk']   = sc_aowr[r['t']]['clk']
                 r['sc_aowr_drift'] = sc_aowr[r['t']]['drift']
+                # Logs from before the out_log_pos() CLIGHT-division fix: in
+                # AOWR clock-fixed mode, dtr[0] is already seconds (retained
+                # from clock_est), but out_log_pos() divided it by CLIGHT
+                # anyway whenever stat==SOLQ_PPP, landing at ~1e-11 s which
+                # rounds to exactly 0.000000000 at the log's %.9f precision.
+                # sc_aowr_clk is that same clock_est value (same 'time' tick,
+                # written by the same update_sol() call) -- use it to recover
+                # dtr_s for exactly the rows showing that corruption
+                # signature (q=6 PPP, dtr logged as exactly zero).
+                if r['q'] == 6 and r['dtr'] == 0.0:
+                    r['dtr'] = sc_aowr[r['t']]['clk']
+                    n_reconstructed += 1
         print(f'Merged {len(sc_aowr)} SC_AOWR clock/drift entries')
+        if n_reconstructed:
+            print(f'Reconstructed dtr_s for {n_reconstructed} PPP epoch(s) '
+                  '(pre-fix CLIGHT-division bug in out_log_pos(); see '
+                  'sc_aowr_clk_s for the source value)')
 
     pppos_dbg = parse_pppos_dbg_log(args.logfile)
     if pppos_dbg:

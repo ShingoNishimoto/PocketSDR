@@ -102,6 +102,7 @@ static sol_t  s_sc_ref_sol     = {0};  // last reference solution (SPP mode; mir
 static int    s_spp_fail_n     = 0;    // consecutive SPP_SEED failures in SC clock-fixed mode
 static int    s_ref_spp_fail_n = 0;    // consecutive REF_SPP_SEED failures for s_sc_ref_rtk
 static int    s_ppp_fail_n     = 0;    // consecutive non-PPP (stuck at SPP) epochs in SC clock-fixed mode
+static int    s_ref_ppp_fail_n = 0;    // consecutive non-PPP (stuck at SPP) epochs for s_sc_ref_rtk
 
 /* SC antenna attitude — defined in lib/RTKLIB/src/rtkcmn.c (keeps librtk.a self-contained).
  * Set at startup from the options file; satazel() reads them in the antenna-frame path. */
@@ -316,12 +317,24 @@ static void out_log_pos(double time, const sol_t *sol, int nsat,
                         const ssat_t *ssat)
 {
     double ep[6], pos[3], P[9], Q[9], dop[4] = {0};
-    /* sol->dtr[0] unit depends on which solver produced the solution:
-     *   pppos (stat=SOLQ_PPP)  → meters (= x[IC_GPS] from KF state)
-     *   pntpos (stat=SOLQ_SINGLE) → seconds, even when pmode=PPP (SPP fallback)
-     * PPP always uses uncorrected observations and estimates its own clock; dtr
-     * is always in meters regardless of AOWR mode. */
-    int dtr_in_meters = (sol->stat == SOLQ_PPP);
+    /* sol->dtr[0] unit depends on which solver produced the solution AND
+     * whether the clock is externally fixed (AOWR/SC mode):
+     *   pppos, free clock   (stat=SOLQ_PPP)    -> meters (= x[IC_GPS] from KF state)
+     *   pppos, clock_bias_fixed (stat=SOLQ_PPP) -> seconds -- update_stat() in
+     *     ppp.c deliberately never touches sol.dtr[0] in this mode; it retains
+     *     exactly what the caller set it to (clock_est, already in seconds) at
+     *     the "pvt->rtk->sol.dtr[0] = clock_est" assignment above. Dividing
+     *     this by CLIGHT (as the free-clock case requires) shrinks an already
+     *     ms-scale value by another ~3e8, which rounds to 0.000000000 at the
+     *     %.9f log precision -- this was silently zeroing the AOWR-fixed main
+     *     solver's dtr for every PPP epoch.
+     *   pntpos (stat=SOLQ_SINGLE) -> seconds, even when pmode=PPP (SPP fallback)
+     * clock_bias_fixed is SC-mode-only and, once latched on by the first AOWR
+     * fix, never resets for the rest of the session; the main solver's stat
+     * cannot reach SOLQ_PPP before that (suppressed while !sc_clk_ready), so
+     * sdr_ps_sc_mode is a safe proxy for "was clock_bias_fixed active" here
+     * without needing to plumb prcopt_t through this function. */
+    int dtr_in_meters = (sol->stat == SOLQ_PPP) && !sdr_ps_sc_mode;
     double dtr_s      = dtr_in_meters ? sol->dtr[0] / CLIGHT : sol->dtr[0];
     time2epoch(timeadd(sol->time, dtr_s), ep);
     ecef2pos(sol->rr, pos);
@@ -1865,6 +1878,14 @@ static void update_sol(sdr_pvt_t *pvt)
                                                       : pvt->rtk->sol.rr[j];
 
         pntpos(obs, nobs, pvt->nav, &spopt, &pvt->rtk->sol, NULL, pvt->rtk->ssat, msg);
+        /* See the matching REF_SPP_SEED comment below: lsq() can leave NaN in
+         * sol.dtr[] on a singular matrix even when sol.stat=0. clock_bias_fixed
+         * mode overwrites dtr[0] before this call, but dtr[1..NSYS-1] (other
+         * constellations' inter-system biases) are still solved here and can
+         * carry NaN into udclk_ppp()'s unconditional per-epoch reseed. */
+        for (int i = 0; i < NSYS; i++) {
+            if (!isfinite(pvt->rtk->sol.dtr[i])) pvt->rtk->sol.dtr[i] = 0.0;
+        }
         if (pvt->rtk->sol.stat) spp_sol = pvt->rtk->sol;
         sdr_log(3, "$LOG,%.3f,SPP_SEED stat=%d dtr=%.9f msg=%s",
             time, pvt->rtk->sol.stat, pvt->rtk->sol.dtr[0],
@@ -2012,6 +2033,45 @@ static void update_sol(sdr_pvt_t *pvt)
             rspopt.maxgdop = sdr_maxgdop;
             pntpos(obs_ref, nobs_ref, pvt->nav, &rspopt, &s_sc_ref_rtk->sol,
                    NULL, s_sc_ref_rtk->ssat, msg);
+            /* pntpos()'s lsq() can return NaN in sol.dtr[] on a singular/
+             * rank-deficient normal-equations matrix (e.g. too few sats near
+             * the end of a pass) while still leaving sol.stat=0 -- seen live
+             * as "REF_SPP_SEED stat=0 dtr=nan". Downstream code treats
+             * dtr[i]!=0.0 as "has a value to seed the clock state with" (true
+             * for NaN too, since NaN!=0.0), and pppos()'s own udclk_ppp()
+             * unconditionally reseeds x[IC]=CLIGHT*sol.dtr[0] every epoch
+             * regardless of stat -- so an unsanitized NaN here poisons the
+             * whole KF state and can silently surface later as a bogus
+             * SOLQ_PPP result (NaN comparisons are false, so magnitude-based
+             * validity checks don't catch it). Sanitize at the source.
+             *
+             * A rank-deficient/high-PDOP epoch can also converge to a huge
+             * but FINITE garbage value instead of NaN (seen live: dtr
+             * jumping to ~1.39e6 "seconds" and then freezing at that exact
+             * value for 10+ consecutive epochs). estpos() in pntpos.c
+             * warm-starts its Newton iteration from sol->rr[]/sol->dtr[]
+             * every call (no reset to zero), so once poisoned, every
+             * subsequent pntpos() call re-diverges from the same garbage
+             * seed with nothing to break the cycle -- observed live as a
+             * ~19-minute $REFPOS gap while the main solver kept getting PPP
+             * fixes throughout, because the main solver's clock term is
+             * force-overwritten from clock_est every epoch (see
+             * "pvt->sol->dtr[0] = clock_est" above) and is therefore immune
+             * to this same failure mode. Bound-check magnitude too, not
+             * just isfinite: no real receiver clock bias reaches 1 s, and
+             * no real receiver position is 100,000 km from Earth's center. */
+            for (int i = 0; i < NSYS; i++) {
+                if (!isfinite(s_sc_ref_rtk->sol.dtr[i]) ||
+                    fabs(s_sc_ref_rtk->sol.dtr[i]) > 1.0) {
+                    s_sc_ref_rtk->sol.dtr[i] = 0.0;
+                }
+            }
+            {
+                double rnorm = norm(s_sc_ref_rtk->sol.rr, 3);
+                if (!isfinite(rnorm) || rnorm > 1e8) {
+                    for (int i = 0; i < 6; i++) s_sc_ref_rtk->sol.rr[i] = 0.0;
+                }
+            }
             sdr_log(3, "$LOG,%.3f,REF_SPP_SEED stat=%d dtr=%.9f",
                 time, s_sc_ref_rtk->sol.stat, s_sc_ref_rtk->sol.dtr[0]);
 
@@ -2048,6 +2108,24 @@ static void update_sol(sdr_pvt_t *pvt)
             }
 
             pppos(s_sc_ref_rtk, obs_ref, nobs_ref, pvt->nav);
+
+            /* Same fix as SC_PPP_FAIL_RESET for the main solver above: the
+             * reset just above only counts consecutive REF_SPP_SEED (pntpos)
+             * failures, so it never fires if SPP keeps succeeding while
+             * pppos() itself stays stuck rejecting every epoch (e.g. after
+             * an early bad-geometry epoch corrupts the float state) -- s_sc_
+             * ref_rtk can then sit at SOLQ_SINGLE for an entire session even
+             * though nothing is currently wrong with the data. */
+            if (s_sc_ref_rtk->sol.stat == SOLQ_PPP) {
+                s_ref_ppp_fail_n = 0;
+            } else if (++s_ref_ppp_fail_n >= SC_PPP_FAIL_RESET) {
+                int rnx = s_sc_ref_rtk->nx;
+                memset(s_sc_ref_rtk->x, 0, rnx * sizeof(double));
+                memset(s_sc_ref_rtk->P, 0, rnx * rnx * sizeof(double));
+                s_ref_ppp_fail_n = 0;
+                sdr_log(3, "$LOG,%.3f,REF_PPP_KF_RESET (stuck non-PPP %d epochs)",
+                    time, SC_PPP_FAIL_RESET);
+            }
 
             // Dynamics startup fix (same as main PPP)
             if (s_sc_ref_rtk->opt.dynamics) {
@@ -2322,7 +2400,13 @@ static void update_sol(sdr_pvt_t *pvt)
             ssat->snr[0] * SNR_UNIT, ssat->azel[0] * R2D, ssat->azel[1] * R2D,
             ssat->resp[0]);
     }
-    s_rx_clock_s  = (pvt->sol->stat == SOLQ_PPP) ?
+    // Same unit caveat as out_log_pos(): dtr[0] is only in meters for a
+    // free-clock PPP solve, not when clock_bias_fixed (SC mode) held it in
+    // seconds. In practice this value is only ever consumed under GS mode
+    // (write_aowr_gs() below), where clock_bias_fixed can't be set (GS/SC
+    // are mutually exclusive process roles) -- but guard it anyway rather
+    // than relying on that being true forever.
+    s_rx_clock_s  = (pvt->sol->stat == SOLQ_PPP) && !sdr_ps_sc_mode ?
         pvt->sol->dtr[0] / CLIGHT : pvt->sol->dtr[0];
     s_rx_sol_valid = (pvt->sol->stat > 0);
     // Write GS ring-buffer at every PVT epoch once PS has been observed,

@@ -217,10 +217,29 @@ def main():
         sys.exit(1)
     print(f'Base obs: {len(base_obs)} file(s)')
 
-    # A single glob argument lets rnx2rtkp itself expand+concatenate
-    # multi-chunk base data; quoting matters so the shell doesn't pre-expand it.
-    base_arg = os.path.join(session, BASE_OBS_GLOB) if len(base_obs) > 1 \
-        else base_obs[0]
+    # Pass ONE wildcard string restricted to .rnx (never separate filenames,
+    # never a glob matching .crx too). Both alternatives were tried and are
+    # broken in verified-live ways:
+    #   - separate argv entries (one per chunk file): RTKLIB's postpos()
+    #     assigns a receiver number (rcv) per ORIGINAL ARGUMENT POSITION
+    #     (postpos.c: "index[k++]=j" per infile[] arg, and readobsnav()
+    #     increments rcv every time index[i] changes between consecutive
+    #     files). N separate base-chunk arguments become N different
+    #     "receivers" (rcv=2,3,4,...), and the rover(1)/base(2) baseline
+    #     solve only continues through the temporal span where rcv=1 and
+    #     rcv=2 overlap -- i.e. only the FIRST chunk. Later chunks are
+    #     silently ignored; the run looks like it succeeded (nonzero solution
+    #     count) but truncates hours/minutes early with no error or warning.
+    #   - a glob matching BOTH .crx and .rnx (e.g. "*_MO.*") in one argument:
+    #     RTKLIB's own expath()/reppaths() DOES expand this internally and
+    #     keeps all matches under one rcv (correct grouping) -- but readrnxt()
+    #     can't parse the raw Hatanaka-compressed .crx text as normal RINEX,
+    #     which kills the whole read (0 solution epochs, no error).
+    # A single "*_MO.rnx" argument avoids both: one rcv group (via RTKLIB's
+    # own internal expansion, not the shell/subprocess), uncompressed only.
+    base_arg = os.path.join(session, '*_MO.rnx') if any(
+        p.endswith('.rnx') for p in base_obs) else \
+        os.path.join(session, BASE_OBS_GLOB)
 
     nav_arg = rover_nav if os.path.isfile(rover_nav) else None
     if nav_arg is None:
@@ -240,6 +259,29 @@ def main():
 
     with open(out_path) as f:
         rows = [l for l in f if not l.startswith('%')]
+
+    # The single-wildcard-argument approach above is the theoretically
+    # correct one (verified: full-coverage, matches RTKLIB's own receiver-
+    # role assignment), but it has been observed -- on real GA base data --
+    # to sometimes fail completely (0 epochs) for reasons not yet root-caused
+    # (confirmed live: reproduces even with the chunks pre-merged into one
+    # physical file, so it isn't the multi-file-argument bug this function
+    # exists to avoid). Rather than silently hand back nothing, fall back to
+    # passing each chunk as a separate argument: RTKLIB then treats each as a
+    # distinct receiver and the solve only covers the span where the rover
+    # and the FIRST chunk overlap -- a real limitation (later chunks are
+    # dropped), but partial coverage beats a hard failure.
+    if not rows and len(base_obs) > 1:
+        print(f'\n{out_path}: 0 solution epochs with the combined base arg -- '
+              'retrying with base chunks as separate arguments (partial '
+              'coverage only: solving stops at the end of the first chunk).',
+              file=sys.stderr)
+        base_rnx = sorted(p for p in base_obs if p.endswith('.rnx')) or base_obs
+        run([rnx2rtkp, '-k', args.conf, rover_obs, *base_rnx, nav_arg,
+            '-o', out_path], check=True)
+        with open(out_path) as f:
+            rows = [l for l in f if not l.startswith('%')]
+
     print(f'\n{out_path}: {len(rows)} solution epoch(s)')
     if rows:
         from collections import Counter
